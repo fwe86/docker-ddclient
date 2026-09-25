@@ -83,7 +83,15 @@ jobs:
             "https://api.github.com/repos/${DDCLIENT_REPOSITORY}/releases?per_page=100")
 
           DDCLIENT_VERSION=$(echo "$DDCLIENT_JSON" | jq -r \
-            '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0].tag_name')
+            '[.[] |
+                select(
+                  .draft == false and
+                  .published_at != null
+                )
+              ] |
+              sort_by(.published_at) |
+              reverse |
+              .[0].tag_name')
 
           if [[ -z "$DDCLIENT_VERSION" || "$DDCLIENT_VERSION" == "null" ]]; then
             echo "ERROR: Could not determine latest ddclient release."
@@ -146,12 +154,31 @@ jobs:
         with:
           repository: ${{ env.LSIO_REPOSITORY }}
           ref: ${{ needs.check.outputs.lsio_tag }}
+          fetch-depth: 0
 
-      - name: Set build information
+      - name: Verify LinuxServer checkout
         shell: bash
+        env:
+          EXPECTED_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
+          set -euo pipefail
+
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          TAG_COMMIT=$(git rev-list -n 1 "${EXPECTED_TAG}")
+
+          echo "Expected LinuxServer tag : ${EXPECTED_TAG}"
+          echo "Checked out commit       : ${ACTUAL_COMMIT}"
+          echo "Tag points to commit      : ${TAG_COMMIT}"
+
+          if [[ "${ACTUAL_COMMIT}" != "${TAG_COMMIT}" ]]; then
+            echo "ERROR: Checked out commit does not match LinuxServer tag ${EXPECTED_TAG}."
+            exit 1
+          fi
+
+          echo "LinuxServer checkout verified successfully."
+
+          echo "LSIO_COMMIT=${ACTUAL_COMMIT}" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
-          echo "LSIO_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
