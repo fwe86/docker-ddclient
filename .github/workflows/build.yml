@@ -192,15 +192,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "${RUNNER_TEMP}/source"
+          SOURCE_DIR="${RUNNER_TEMP}/source"
+          DDCLIENT_EXTRACT_DIR="${RUNNER_TEMP}/ddclient-source"
+
+          mkdir -p "${SOURCE_DIR}"
+          mkdir -p "${DDCLIENT_EXTRACT_DIR}"
 
           echo "Creating LinuxServer source archive..."
 
           git archive \
             --format=tar.gz \
             --prefix="linuxserver-docker-ddclient-${LSIO_TAG}/" \
-            --output="${RUNNER_TEMP}/source/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
+            --output="${SOURCE_DIR}/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
             "${LSIO_TAG}"
+
+          echo "Copying LinuxServer license..."
+
+          if [[ ! -f LICENSE ]]; then
+            echo "ERROR: LinuxServer LICENSE file not found."
+            exit 1
+          fi
+
+          cp LICENSE \
+            "${SOURCE_DIR}/LICENSE-linuxserver-docker-ddclient"
 
           echo "Downloading exact ddclient source archive..."
 
@@ -209,47 +223,101 @@ jobs:
             --location \
             --silent \
             --show-error \
-            --output "${RUNNER_TEMP}/source/ddclient-${DDCLIENT_VERSION}.tar.gz" \
+            --output "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz" \
             "https://github.com/${DDCLIENT_REPOSITORY}/archive/refs/tags/${DDCLIENT_VERSION}.tar.gz"
 
-          cat > "${RUNNER_TEMP}/source/SOURCE_INFO.txt" <<EOF
+          echo "Extracting ddclient license information..."
+
+          tar \
+            -xzf "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz" \
+            -C "${DDCLIENT_EXTRACT_DIR}"
+
+          DDCLIENT_SOURCE_ROOT=$(find "${DDCLIENT_EXTRACT_DIR}" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -print \
+            -quit)
+
+          if [[ -z "${DDCLIENT_SOURCE_ROOT}" ]]; then
+            echo "ERROR: Could not determine extracted ddclient source directory."
+            exit 1
+          fi
+
+          if [[ ! -f "${DDCLIENT_SOURCE_ROOT}/COPYING" ]]; then
+            echo "ERROR: ddclient COPYING file not found."
+            exit 1
+          fi
+
+          if [[ ! -f "${DDCLIENT_SOURCE_ROOT}/COPYRIGHT" ]]; then
+            echo "ERROR: ddclient COPYRIGHT file not found."
+            exit 1
+          fi
+
+          cp "${DDCLIENT_SOURCE_ROOT}/COPYING" \
+            "${SOURCE_DIR}/LICENSE-ddclient"
+
+          cp "${DDCLIENT_SOURCE_ROOT}/COPYRIGHT" \
+            "${SOURCE_DIR}/COPYRIGHT-ddclient"
+
+          echo "Creating source information..."
+
+          cat > "${SOURCE_DIR}/SOURCE_INFO.txt" <<EOF
           Image:
           ${{ needs.check.outputs.image_name }}:${IMAGE_TAG}
 
-          LinuxServer.io docker-ddclient:
+          Direct upstream sources used by this build:
+
+          LinuxServer.io docker-ddclient
           Repository: https://github.com/${LSIO_REPOSITORY}
           Release: ${LSIO_TAG}
           Commit: ${LSIO_COMMIT}
           License: GPL-3.0
+          Source archive: linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz
+          License file: LICENSE-linuxserver-docker-ddclient
 
-          ddclient:
+          ddclient
           Repository: https://github.com/${DDCLIENT_REPOSITORY}
           Release: ${DDCLIENT_VERSION}
           License: GPL-2.0-or-later
+          Source archive: ddclient-${DDCLIENT_VERSION}.tar.gz
+          License file: LICENSE-ddclient
+          Copyright file: COPYRIGHT-ddclient
 
-          These archives contain the exact upstream source versions directly
-          selected by this project's build process.
+          The source archives preserve the exact versions of the two direct
+          upstream projects selected by this build.
 
-          The resulting container also contains third-party packages from the
-          LinuxServer.io Alpine base image and Alpine repositories. Those
-          components remain subject to their respective licenses.
+          The resulting container image additionally contains the LinuxServer.io
+          base image, Alpine Linux packages, Perl modules and other third-party
+          components. Those components remain subject to their respective
+          copyright and license terms.
+
+          Publication of these source archives and license files does not
+          relicense any upstream component.
           EOF
 
+          echo "Creating checksums..."
+
           (
-            cd "${RUNNER_TEMP}/source"
+            cd "${SOURCE_DIR}"
+
             sha256sum \
               "linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
               "ddclient-${DDCLIENT_VERSION}.tar.gz" \
+              "LICENSE-linuxserver-docker-ddclient" \
+              "LICENSE-ddclient" \
+              "COPYRIGHT-ddclient" \
+              "SOURCE_INFO.txt" \
               > SHA256SUMS
           )
 
           echo
-          echo "Prepared source files:"
-          ls -lh "${RUNNER_TEMP}/source"
+          echo "Prepared source and license files:"
+          ls -lh "${SOURCE_DIR}"
 
           echo
           echo "Checksums:"
-          cat "${RUNNER_TEMP}/source/SHA256SUMS"
+          cat "${SOURCE_DIR}/SHA256SUMS"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -366,6 +434,9 @@ jobs:
             gh release upload "${RELEASE_TAG}" \
               "${RUNNER_TEMP}/source/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
               "${RUNNER_TEMP}/source/ddclient-${DDCLIENT_VERSION}.tar.gz" \
+              "${RUNNER_TEMP}/source/LICENSE-linuxserver-docker-ddclient" \
+              "${RUNNER_TEMP}/source/LICENSE-ddclient" \
+              "${RUNNER_TEMP}/source/COPYRIGHT-ddclient" \
               "${RUNNER_TEMP}/source/SOURCE_INFO.txt" \
               "${RUNNER_TEMP}/source/SHA256SUMS" \
               --repo "${GITHUB_REPOSITORY}" \
@@ -374,6 +445,9 @@ jobs:
             gh release create "${RELEASE_TAG}" \
               "${RUNNER_TEMP}/source/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
               "${RUNNER_TEMP}/source/ddclient-${DDCLIENT_VERSION}.tar.gz" \
+              "${RUNNER_TEMP}/source/LICENSE-linuxserver-docker-ddclient" \
+              "${RUNNER_TEMP}/source/LICENSE-ddclient" \
+              "${RUNNER_TEMP}/source/COPYRIGHT-ddclient" \
               "${RUNNER_TEMP}/source/SOURCE_INFO.txt" \
               "${RUNNER_TEMP}/source/SHA256SUMS" \
               --repo "${GITHUB_REPOSITORY}" \
