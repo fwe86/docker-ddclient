@@ -1,34 +1,157 @@
-name: Build ddclient RC
+name: Build ddclient
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build even if this version already exists"
+        required: false
+        default: false
+        type: boolean
+
+  schedule:
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
   packages: write
 
 env:
-  DDCLIENT_VERSION: v4.0.1-rc.1
+  LSIO_REPOSITORY: linuxserver/docker-ddclient
+  DDCLIENT_REPOSITORY: ddclient/ddclient
 
 jobs:
+  check:
+    name: Check upstream releases
+    runs-on: ubuntu-latest
+
+    outputs:
+      build_required: ${{ steps.check_image.outputs.build_required }}
+      ddclient_version: ${{ steps.versions.outputs.ddclient_version }}
+      lsio_version: ${{ steps.versions.outputs.lsio_version }}
+      lsio_build: ${{ steps.versions.outputs.lsio_build }}
+      lsio_tag: ${{ steps.versions.outputs.lsio_tag }}
+      image_name: ${{ steps.image.outputs.image_name }}
+      image_tag: ${{ steps.versions.outputs.image_tag }}
+
+    steps:
+      - name: Determine image name
+        id: image
+        shell: bash
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${IMAGE_NAME}"
+
+      - name: Get latest upstream releases
+        id: versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Getting latest LinuxServer release..."
+
+          LSIO_JSON=$(curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${LSIO_REPOSITORY}/releases/latest")
+
+          LSIO_TAG=$(echo "$LSIO_JSON" | jq -r '.tag_name')
+
+          if [[ -z "$LSIO_TAG" || "$LSIO_TAG" == "null" ]]; then
+            echo "ERROR: Could not determine latest LinuxServer release."
+            exit 1
+          fi
+
+          if [[ ! "$LSIO_TAG" =~ -ls([0-9]+)$ ]]; then
+            echo "ERROR: Unexpected LinuxServer release tag: ${LSIO_TAG}"
+            exit 1
+          fi
+
+          LSIO_BUILD="${BASH_REMATCH[1]}"
+          LSIO_VERSION="${LSIO_TAG%-ls${LSIO_BUILD}}"
+
+          echo "Getting newest published ddclient release including prereleases..."
+
+          DDCLIENT_JSON=$(curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${DDCLIENT_REPOSITORY}/releases?per_page=100")
+
+          DDCLIENT_VERSION=$(echo "$DDCLIENT_JSON" | jq -r \
+            '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0].tag_name')
+
+          if [[ -z "$DDCLIENT_VERSION" || "$DDCLIENT_VERSION" == "null" ]]; then
+            echo "ERROR: Could not determine latest ddclient release."
+            exit 1
+          fi
+
+          IMAGE_TAG="${DDCLIENT_VERSION}-ls${LSIO_BUILD}"
+
+          echo
+          echo "Detected versions:"
+          echo "  LinuxServer release : ${LSIO_TAG}"
+          echo "  LinuxServer version : ${LSIO_VERSION}"
+          echo "  LinuxServer build   : ls${LSIO_BUILD}"
+          echo "  ddclient release    : ${DDCLIENT_VERSION}"
+          echo "  Resulting image tag : ${IMAGE_TAG}"
+
+          echo "lsio_tag=${LSIO_TAG}" >> "$GITHUB_OUTPUT"
+          echo "lsio_version=${LSIO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "lsio_build=${LSIO_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "ddclient_version=${DDCLIENT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether image already exists
+        id: check_image
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.image_name }}
+          IMAGE_TAG: ${{ steps.versions.outputs.image_tag }}
+          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking ${IMAGE_NAME}:${IMAGE_TAG}"
+
+          if [[ "$FORCE_BUILD" == "true" ]]; then
+            echo "Force build requested."
+            echo "build_required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if docker manifest inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Image already exists."
+            echo "No build required."
+            echo "build_required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image does not exist."
+            echo "Build required."
+            echo "build_required=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    name: Build and publish image
+    needs: check
+    if: needs.check.outputs.build_required == 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout LinuxServer ddclient
+      - name: Checkout LinuxServer release
         uses: actions/checkout@v4
         with:
-          repository: linuxserver/docker-ddclient
-          ref: master
+          repository: ${{ env.LSIO_REPOSITORY }}
+          ref: ${{ needs.check.outputs.lsio_tag }}
 
       - name: Set build information
+        shell: bash
         run: |
           echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
-          echo "LSIO_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-
-      - name: Set image name
-        run: |
-          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/docker-ddclient" >> "$GITHUB_ENV"
+          echo "LSIO_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -38,24 +161,65 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
         run: |
+          set -euo pipefail
+
           docker build \
             --pull \
             --build-arg DDCLIENT_VERSION="${DDCLIENT_VERSION}" \
-            --build-arg VERSION="${DDCLIENT_VERSION}-${LSIO_COMMIT}" \
+            --build-arg VERSION="${IMAGE_TAG}" \
             --build-arg BUILD_DATE="${BUILD_DATE}" \
-            -t "${IMAGE_NAME}:${DDCLIENT_VERSION}" \
+            --label "org.opencontainers.image.version=${IMAGE_TAG}" \
+            --label "org.opencontainers.image.revision=${LSIO_COMMIT}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             -t "${IMAGE_NAME}:latest" \
+            -t "${IMAGE_NAME}:${DDCLIENT_VERSION}" \
+            -t "${IMAGE_NAME}:ls${LSIO_BUILD}" \
+            -t "${IMAGE_NAME}:${IMAGE_TAG}" \
             .
 
       - name: Verify ddclient version
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
         run: |
-          docker run --rm \
-            --entrypoint ddclient \
-            "${IMAGE_NAME}:${DDCLIENT_VERSION}" \
-            --version
+          set -euo pipefail
 
-      - name: Push image
+          OUTPUT=$(docker run --rm \
+            --entrypoint ddclient \
+            "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --version)
+
+          echo "$OUTPUT"
+
+          EXPECTED_VERSION="${DDCLIENT_VERSION#v}"
+
+          if ! grep -Fq "ddclient version ${EXPECTED_VERSION}" <<< "$OUTPUT"; then
+            echo "ERROR: Built ddclient version does not match ${DDCLIENT_VERSION}."
+            exit 1
+          fi
+
+          echo "Verified ddclient ${EXPECTED_VERSION} successfully."
+
+      - name: Push images
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
         run: |
-          docker push "${IMAGE_NAME}:${DDCLIENT_VERSION}"
+          set -euo pipefail
+
           docker push "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:${DDCLIENT_VERSION}"
+          docker push "${IMAGE_NAME}:ls${LSIO_BUILD}"
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}"
