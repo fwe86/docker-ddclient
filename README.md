@@ -178,6 +178,9 @@ The release contains:
 ```text
 linuxserver-docker-ddclient-v4.0.0-ls233.tar.gz
 ddclient-v4.0.1-rc.1.tar.gz
+LICENSE-linuxserver-docker-ddclient
+LICENSE-ddclient
+COPYRIGHT-ddclient
 SOURCE_INFO.txt
 SHA256SUMS
 ```
@@ -186,7 +189,9 @@ The LinuxServer.io archive is created from the exact Git tag used to build the i
 
 The ddclient archive contains the exact published ddclient release selected through `DDCLIENT_VERSION`.
 
-`SOURCE_INFO.txt` records the relationship between the image and its upstream sources, while `SHA256SUMS` provides SHA-256 checksums for the source archives.
+The original LinuxServer.io license, ddclient license, and ddclient copyright information are also published separately for convenient access. These files are copied unchanged from the exact upstream source versions used by the build.
+
+`SOURCE_INFO.txt` records the relationship between the image, source archives, license files, and upstream versions. `SHA256SUMS` provides SHA-256 checksums for all published source, license, copyright, and source-information files.
 
 The container also contains software supplied by the LinuxServer.io base image, Alpine Linux packages, Perl modules, and other third-party components. These components remain subject to their respective copyright and license terms.
 
@@ -240,7 +245,7 @@ A mismatch prevents the image from being published.
 
 ### Source checksums
 
-SHA-256 checksums are generated for both archived upstream source trees and published alongside them as:
+SHA-256 checksums are generated for the archived upstream sources, separately published license and copyright files, and `SOURCE_INFO.txt`. They are published alongside the release assets as:
 
 ```text
 SHA256SUMS
