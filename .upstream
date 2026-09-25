@@ -1,0 +1,6 @@
+DDCLIENT_VERSION=v4.0.1-rc.1
+LSIO_RELEASE=v4.0.0-ls233
+LSIO_BUILD=ls233
+IMAGE=ghcr.io/fwe86/docker-ddclient
+IMAGE_VERSION=v4.0.1-rc.1-ls233
+SOURCE_RELEASE=image-v4.0.1-rc.1-ls233
