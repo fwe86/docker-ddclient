@@ -4,129 +4,134 @@
 [![GitHub Container Registry](https://img.shields.io/badge/GHCR-docker--ddclient-blue?logo=github)](https://github.com/fwe86/docker-ddclient/pkgs/container/docker-ddclient)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-Automated Docker builds of [ddclient](https://github.com/ddclient/ddclient) based on the official [LinuxServer.io ddclient Docker repository](https://github.com/linuxserver/docker-ddclient).
+Automated Docker builds of [ddclient](https://github.com/ddclient/ddclient)
+based on the official
+[LinuxServer.io ddclient Docker repository](https://github.com/linuxserver/docker-ddclient).
 
-The purpose of this repository is to provide an up-to-date LinuxServer.io-based ddclient image that automatically tracks the **newest published ddclient release, including pre-releases**.
+The purpose of this repository is to provide an up-to-date LinuxServer.io-based
+ddclient image that automatically tracks the **newest published ddclient
+release, including pre-releases**.
 
-> **Independent project:** This repository and the images published from it are not affiliated with, endorsed by, or maintained by LinuxServer.io or the ddclient project.
+> **Independent project:** This repository and the images published from it are
+> not affiliated with, endorsed by, or maintained by LinuxServer.io or the
+> ddclient project.
 
 ## Quick start
-
-Pull the latest successfully built image:
 
 ```bash
 docker pull ghcr.io/fwe86/docker-ddclient:latest
 ```
 
-For reproducible deployments, use the fully qualified ddclient/LinuxServer.io version tag instead of `latest`, for example:
+For reproducible deployments, use the exact ddclient/LinuxServer.io combination
+instead of `latest`, for example:
 
 ```bash
 docker pull ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
 ```
 
-Available images are published to the [GitHub Container Registry](https://github.com/fwe86/docker-ddclient/pkgs/container/docker-ddclient).
+Exact combination tags are immutable once published.
 
-## Why does this repository exist?
+## Why this repository exists
 
-The official LinuxServer.io ddclient build determines the latest stable ddclient release through GitHub's `releases/latest` API when no explicit version is supplied during the build.
+The official LinuxServer.io ddclient build can be supplied an explicit
+`DDCLIENT_VERSION`. This project determines the newest **published** ddclient
+release itself, including release candidates and other published pre-releases,
+and supplies that release to LinuxServer.io's existing build mechanism.
 
-GitHub's `releases/latest` endpoint does not select pre-releases such as release candidates. This can result in a newer published ddclient pre-release being available while the official LinuxServer.io image still uses the previous stable version.
+The project does not maintain a copied fork of the LinuxServer.io container
+implementation. It checks out an exact published LinuxServer.io release and
+adds only a small project-owned final stage for independent image identity,
+provenance, and init branding.
 
-This repository deliberately selects the newest published ddclient release, including pre-releases, and supplies it to LinuxServer.io's existing `DDCLIENT_VERSION` build mechanism.
+## Build and publication process
 
-The LinuxServer.io source release is built unchanged as an intermediate image. A small project-owned final-stage Dockerfile then applies this project's own image identity, provenance metadata, and init branding. No LinuxServer.io Dockerfile or root filesystem file is copied into or maintained by this repository.
+The workflow checks:
 
-## How it works
+- `ddclient/ddclient` for the newest published release, including pre-releases;
+- `linuxserver/docker-ddclient` for the latest published LinuxServer.io release.
 
-The GitHub Actions workflow periodically checks two upstream projects:
+For a new version combination it then:
 
-- [ddclient/ddclient](https://github.com/ddclient/ddclient)
-- [linuxserver/docker-ddclient](https://github.com/linuxserver/docker-ddclient)
+1. verifies the exact LinuxServer.io source tag and commit;
+2. archives the exact project, LinuxServer.io, and ddclient sources;
+3. resolves the moving LinuxServer.io base-image tag to an immutable registry
+   digest;
+4. archives the corresponding LinuxServer.io base and s6-overlay source;
+5. builds the LinuxServer.io source using a mechanically generated Dockerfile
+   whose only intended source change is the base-image `FROM` pin;
+6. builds the independently branded project final stage;
+7. verifies image identity, upstream provenance, branding, and ddclient version;
+8. inventories every APK package actually present in the final image and
+   collects the exact Alpine aports recipe plus fetched/verified source inputs;
+9. discovers CPAN distributions actually installed below `/usr/local` and
+   collects their exact source releases;
+10. generates and verifies an SPDX JSON SBOM;
+11. creates SHA-256 checksums and an immutable GitHub compliance release;
+12. verifies that source/compliance release **before** logging into GHCR;
+13. publishes mutable convenience tags and finally the immutable exact tag;
+14. attaches the registry digest to the already published compliance release;
+15. updates `.upstream` only after successful publication.
 
-For ddclient, the newest **published release** is selected. This deliberately includes published pre-releases such as release candidates, but excludes drafts and unpublished development versions.
+The detailed compliance design is documented in [COMPLIANCE.md](COMPLIANCE.md).
 
-For LinuxServer.io, the latest published `docker-ddclient` release is used.
+## Source-before-binary publication
 
-For each build:
+The compliance release is intentionally published before the GHCR image.
+Therefore a failed source collection, checksum validation, SBOM generation, or
+GitHub source release stops the workflow before this project distributes the
+new container image.
 
-1. the exact LinuxServer.io release tag is checked out and verified;
-2. the selected ddclient release is supplied through LinuxServer.io's existing `DDCLIENT_VERSION` build argument;
-3. that unchanged LinuxServer.io source tree is built as an intermediate image;
-4. the project-owned final-stage `Dockerfile` creates the published image;
-5. LinuxServer.io branding inherited from the upstream image is replaced with project-specific branding;
-6. image identity, provenance, and the ddclient version are verified before publication;
-7. an SPDX JSON SBOM is generated from the final image;
-8. source archives, license files, wrapper source, branding, SBOM, and checksums are published with a matching GitHub Release.
+Every final image includes labels identifying its exact compliance release,
+LinuxServer.io release/commit, LinuxServer.io base-image digest/source release,
+and project revision.
 
-In simplified form:
+## Immutable exact tags
+
+For an upstream combination such as ddclient `v4.0.1-rc.1` and LinuxServer.io
+build `ls233`, the exact tag is:
 
 ```text
-ddclient latest published release
-              │
-              ├──────────────┐
-              │              │
-              ▼              ▼
-        v4.0.1-rc.1     LinuxServer.io
-                         v4.0.0-ls233
-                              │
-              ┌───────────────┘
-              ▼
-       v4.0.1-rc.1-ls233
-              │
-              ▼
-   Does this image already exist?
-          │           │
-         yes          no
-          │           │
-        stop          ▼
-            Verify LSIO source
-                      │
-                      ▼
-          Build unchanged LSIO image
-                      │
-                      ▼
-           Build independent wrapper
-                      │
-                      ▼
-       Verify identity and branding
-                      │
-                      ▼
-              Verify ddclient
-                      │
-                      ▼
-             Generate SPDX SBOM
-                      │
-                      ▼
-            Generate SHA256SUMS
-                      │
-                      ▼
-                Publish GHCR
-                      │
-                      ▼
-        Publish source/compliance release
-                      │
-                      ▼
-               Update .upstream
+ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
 ```
+
+If that exact tag already exists, the workflow stops. There is deliberately no
+force-rebuild option and no code path that overwrites an exact image tag.
+
+A rebuild that is genuinely required must therefore use a new image version or
+an explicitly changed versioning scheme rather than silently replacing already
+distributed object code.
+
+## Image tags
+
+Each successful build publishes four tags:
+
+```text
+ghcr.io/fwe86/docker-ddclient:latest
+ghcr.io/fwe86/docker-ddclient:<ddclient-release>
+ghcr.io/fwe86/docker-ddclient:ls<LinuxServer-build>
+ghcr.io/fwe86/docker-ddclient:<ddclient-release>-ls<LinuxServer-build>
+```
+
+The first three are convenience aliases and may move. The final combined tag is
+immutable and should be used when explicit version pinning is important.
 
 ## Independent image identity and branding
 
-The image published by this repository is **not** an official LinuxServer.io image.
+The image published by this repository is **not** an official LinuxServer.io
+image.
 
-LinuxServer.io documents that images based on or forked from its images should use their own branding and that non-first-party images must set `LSIO_FIRST_PARTY=false` when replacing the init branding.
-
-The project-owned final stage therefore:
+The project-owned final stage:
 
 - sets `LSIO_FIRST_PARTY=false`;
 - provides its own `/etc/s6-overlay/s6-rc.d/init-adduser/branding`;
-- replaces the inherited `/build_version`;
+- replaces the inherited `/build_version` identity;
 - identifies `fwe86` as maintainer, author, and vendor of the published image;
-- replaces inherited title, source, documentation, version, and revision metadata relevant to image identity;
-- preserves the exact LinuxServer.io release and source commit in dedicated provenance labels.
+- uses project-owned source/documentation/revision labels;
+- records LinuxServer.io and ddclient information separately as upstream
+  provenance;
+- records the exact LinuxServer.io base-image digest and compliance release.
 
-LinuxServer.io remains explicitly credited as the upstream container source. The branding changes only distinguish responsibility for the independently published image.
-
-Relevant image labels include:
+Relevant labels include:
 
 ```text
 maintainer=fwe86
@@ -137,249 +142,122 @@ org.opencontainers.image.source=https://github.com/fwe86/docker-ddclient
 io.github.fwe86.ddclient.version=<ddclient release>
 io.github.fwe86.linuxserver.release=<LinuxServer.io release>
 io.github.fwe86.linuxserver.revision=<LinuxServer.io commit>
+io.github.fwe86.linuxserver.base.digest=<base image digest>
+io.github.fwe86.compliance.release=<GitHub compliance release>
+io.github.fwe86.compliance.url=<GitHub compliance release URL>
 ```
 
-The workflow checks these values and fails before publication if the independent branding is not present or the old `Linuxserver.io version` identification remains in `build_version` or `/build_version`.
+The project intentionally does **not** assign one blanket OCI license expression
+to the complete image. The image contains components under multiple licenses;
+component-level license information is represented by the source material and
+SBOM.
 
-## Automatic builds
+## Compliance release contents
 
-The workflow periodically determines:
-
-1. the latest published LinuxServer.io `docker-ddclient` release;
-2. the latest published ddclient release, including pre-releases;
-3. the resulting unique ddclient/LinuxServer.io version combination;
-4. whether an image for this exact combination already exists.
-
-If the image already exists, no build is performed.
-
-If either upstream project publishes a relevant new release, a new version combination is detected and automatically built.
-
-The workflow can also be started manually using **Actions → Build ddclient → Run workflow**. A manual run can optionally force a rebuild of an already existing version.
-
-## Image tags
-
-Images are published to:
+Compliance release names are unique per successful build attempt:
 
 ```text
-ghcr.io/fwe86/docker-ddclient
+image-<exact-image-tag>-run-<GitHub-run-id>-<attempt>
 ```
 
-Each successful build publishes four tags.
-
-For example, with ddclient `v4.0.1-rc.1` and LinuxServer.io build `ls233`:
-
-```text
-ghcr.io/fwe86/docker-ddclient:latest
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1
-ghcr.io/fwe86/docker-ddclient:ls233
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
-```
-
-### `latest`
+They are never overwritten. Depending on the upstream package set, assets
+include:
 
 ```text
-ghcr.io/fwe86/docker-ddclient:latest
-```
-
-Points to the newest successfully built combination.
-
-### ddclient version
-
-```text
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1
-```
-
-Points to the newest LinuxServer.io build produced with this specific ddclient version.
-
-### LinuxServer.io build
-
-```text
-ghcr.io/fwe86/docker-ddclient:ls233
-```
-
-Points to the newest ddclient release built from this specific LinuxServer.io release.
-
-### Exact version
-
-```text
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
-```
-
-Identifies the exact combination of the ddclient release and LinuxServer.io build.
-
-Use this tag when reproducibility and explicit version pinning are important.
-
-## Source availability and compliance material
-
-For every newly published image combination, the workflow creates a corresponding GitHub Release.
-
-For an image such as:
-
-```text
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
-```
-
-the corresponding release is:
-
-```text
-image-v4.0.1-rc.1-ls233
-```
-
-The release contains:
-
-```text
-linuxserver-docker-ddclient-v4.0.0-ls233.tar.gz
-ddclient-v4.0.1-rc.1.tar.gz
-LICENSE-linuxserver-docker-ddclient
-LICENSE-ddclient
+fwe86-docker-ddclient-<commit>.tar.gz
+linuxserver-docker-ddclient-<release>.tar.gz
+linuxserver-docker-baseimage-alpine-<release>.tar.gz
+ddclient-<release>.tar.gz
+s6-overlay-<release>.tar.gz
+linuxserver-base-embedded-scripts.tar.gz
+alpine-corresponding-source-<release>-<arch>.tar.gz
+cpan-corresponding-source.tar.gz
+ALPINE_PACKAGES.tsv
+ALPINE_SOURCE_UNITS.tsv
+CPAN_COMPONENTS.tsv
+LICENSE-*
 COPYRIGHT-ddclient
+Dockerfile-linuxserver-original
+Dockerfile-linuxserver-pinned
+Dockerfile-linuxserver-base-pin.diff
 Dockerfile-final
-branding
+LINUXSERVER_BASE_IMAGE.json
+BASE_SOURCE_INFO.txt
 SOURCE_INFO.txt
+BUILD_INPUTS.json
 SBOM.spdx.json
 SHA256SUMS
+RELEASE_NOTES.md
 ```
 
-### LinuxServer.io source
+After the exact image has been published, `IMAGE_DIGESTS.txt` is added to the
+same release with the immutable GHCR digest.
 
-The LinuxServer.io archive is created from the exact Git tag verified and used to build the intermediate image. Its original license file is published separately unchanged.
+### Alpine corresponding source
 
-### ddclient source
+The workflow reads the APK installed database from the final image. For every
+installed package it records the exact source-package origin and aports commit,
+archives the matching `APKBUILD` directory and local patches/scripts, and uses
+Alpine `abuild fetch` to retrieve and verify the referenced remote source
+inputs.
 
-The ddclient archive contains the exact published ddclient release selected through `DDCLIENT_VERSION`. Its license and copyright files are published separately unchanged.
+This is done for **all** installed Alpine packages rather than only packages
+pre-classified as GPL/copyleft.
 
-### Project-owned final stage
+### CPAN corresponding source
 
-`Dockerfile-final` and `branding` are the exact project-owned files used to create the final independently branded image. Publishing these files alongside the upstream source archives records the complete project-owned transformation applied after the unchanged LinuxServer.io build.
+Installed CPAN modules are discovered from `.packlist` files. Their installed
+versions are determined inside the final image and resolved to exact MetaCPAN
+release archives. Failure to map an installed module to exact source stops the
+build.
 
 ### SBOM
 
-`SBOM.spdx.json` is generated from the final built container image in SPDX JSON format. It provides an inventory of components detected in the final image, including packages inherited from the LinuxServer.io base image and packages installed by the upstream build.
+`SBOM.spdx.json` is generated from the final built image. ddclient is explicitly
+represented as `GPL-2.0-or-later` because it is installed outside Alpine package
+metadata. The built ddclient version is independently verified with
+`ddclient --version`.
 
-An SBOM is an inventory and does not replace any source-disclosure or license obligations. Upstream components remain subject to their respective licenses.
+An SBOM is an inventory and does not replace source-code, copyright, attribution,
+or notice obligations.
 
-### Checksums
+## Automatic builds
 
-`SHA256SUMS` contains SHA-256 checksums for:
+The workflow runs hourly and can also be started manually through:
 
-- both upstream source archives;
-- both separately published license files;
-- ddclient copyright information;
-- `Dockerfile-final`;
-- `branding`;
-- `SOURCE_INFO.txt`;
-- `SBOM.spdx.json`.
+**Actions → Build ddclient → Run workflow**
 
-The workflow creates the checksum file only after the SBOM has been generated.
+There is no force-rebuild switch. If the exact version tag already exists, no
+new image is built or published.
 
 ## Upstream state
 
-After a new image has been successfully built, verified, published, and its source/compliance release has been created, the workflow updates the `.upstream` file in this repository.
-
-Example:
-
-```text
-DDCLIENT_VERSION=v4.0.1-rc.1
-LSIO_RELEASE=v4.0.0-ls233
-LSIO_BUILD=ls233
-IMAGE=ghcr.io/fwe86/docker-ddclient
-IMAGE_VERSION=v4.0.1-rc.1-ls233
-SOURCE_RELEASE=image-v4.0.1-rc.1-ls233
-```
-
-The file represents the **last successfully built and published upstream combination**.
-
-It is updated only after:
-
-1. the Docker image has been built successfully;
-2. the independent image identity and branding have been verified;
-3. the resulting ddclient version has been verified;
-4. the SPDX SBOM and release checksums have been generated;
-5. all image tags have been successfully published to GHCR;
-6. the corresponding source/compliance release has been published.
-
-The Git history therefore also provides a history of successfully processed upstream releases.
-
-## Verification
-
-### LinuxServer.io release verification
-
-The workflow checks out the exact LinuxServer.io release tag detected through the GitHub API and verifies that the checked-out commit matches the commit referenced by that release tag.
-
-A mismatch causes the workflow to fail before the image is built.
-
-### Project revision verification
-
-The project repository is checked out at the exact workflow commit. The workflow records that commit and fails if the checked-out revision does not match `GITHUB_SHA`.
-
-### Image identity and branding verification
-
-Before publication, the workflow verifies:
-
-- `maintainer=fwe86`;
-- project author, vendor, title, source, version, and revision labels;
-- exact ddclient and LinuxServer.io provenance labels;
-- `LSIO_FIRST_PARTY=false`;
-- project-specific `build_version`;
-- project-specific `/build_version`;
-- project-specific init branding;
-- absence of the old `Linuxserver.io version` identity from `build_version` and `/build_version`.
-
-A mismatch prevents publication.
-
-### ddclient version verification
-
-After building the final image, ddclient is executed inside the resulting container:
-
-```bash
-ddclient --version
-```
-
-The reported version must match the ddclient release selected by the workflow.
-
-A mismatch prevents the image from being published.
-
-### SBOM verification
-
-The workflow generates `SBOM.spdx.json` from the final image and checks that the file exists, is non-empty, and contains the expected SPDX JSON structure before continuing.
-
-### Publication order
-
-The workflow follows this sequence:
+After successful source disclosure and image publication, `.upstream` records
+the exact state, including:
 
 ```text
-Detect upstream versions
-        ↓
-Verify LinuxServer.io source
-        ↓
-Archive upstream sources and licenses
-        ↓
-Build unchanged LinuxServer.io image
-        ↓
-Build independent final image
-        ↓
-Verify image identity and branding
-        ↓
-Verify ddclient version
-        ↓
-Generate and verify SPDX SBOM
-        ↓
-Generate SHA256SUMS
-        ↓
-Publish all GHCR tags
-        ↓
-Publish source/compliance release
-        ↓
-Update .upstream
+DDCLIENT_VERSION=...
+DDCLIENT_COMMIT=...
+LSIO_RELEASE=...
+LSIO_VERSION=...
+LSIO_BUILD=...
+LSIO_COMMIT=...
+LSIO_BASE_IMAGE=...
+LSIO_BASE_DIGEST=...
+LSIO_BASE_RELEASE=...
+LSIO_BASE_COMMIT=...
+IMAGE=...
+IMAGE_DIGEST=...
+COMPLIANCE_RELEASE=...
+PROJECT_REVISION=...
 ```
 
-A failed source check, build, identity check, version check, SBOM generation, registry push, or release publication therefore does not update `.upstream`.
+This update happens only after the new source release and image have both been
+successfully published.
 
 ## Usage
 
 The image retains the LinuxServer.io container structure and configuration.
-
-Example Docker Compose configuration:
 
 ```yaml
 services:
@@ -395,68 +273,61 @@ services:
     restart: unless-stopped
 ```
 
-For configuration options, environment variables, volumes, permissions, and general container usage, refer to the official [LinuxServer.io ddclient documentation](https://docs.linuxserver.io/images/docker-ddclient/). Keep in mind that this repository publishes an independent derivative image, not an official LinuxServer.io image.
+For configuration options, volumes, permissions, and general container usage,
+refer to the official
+[LinuxServer.io ddclient documentation](https://docs.linuxserver.io/images/docker-ddclient/).
+This project publishes an independent derivative image, not an official
+LinuxServer.io image.
 
 ## Update policy
 
-This project deliberately follows the newest **published** ddclient release, including pre-releases.
+`latest` deliberately follows the newest **published** ddclient release,
+including published pre-releases. It may therefore point to a release candidate.
 
-This means that `latest` may point to an image containing a release candidate or another upstream pre-release.
+For a fixed deployment, pin the exact combined version tag rather than
+`latest`.
 
-If you require a fixed or previously tested version, do not rely on `latest`. Pin the image to an explicit tag instead:
-
-```text
-ghcr.io/fwe86/docker-ddclient:v4.0.1-rc.1-ls233
-```
-
-The workflow never builds arbitrary commits from ddclient's development branch. Only releases that have actually been published by the ddclient project are considered.
+The workflow never builds arbitrary ddclient development commits; only
+published ddclient releases are considered.
 
 ## Architectures
 
-Images produced by this repository currently follow the architecture used by the GitHub-hosted build runner.
+Images produced by this repository currently follow the architecture of the
+GitHub-hosted build runner. They should not be assumed to reproduce the official
+LinuxServer.io multi-architecture manifest.
 
-They should not be assumed to provide the same multi-architecture manifest as the official LinuxServer.io image.
-
-The official LinuxServer.io ddclient image may support additional architectures that this repository does not currently reproduce.
-
-## Relationship to the upstream projects
-
-This repository does **not** maintain a fork of ddclient or a copied fork of LinuxServer.io's Docker implementation.
-
-The resulting image is assembled from:
-
-- the original LinuxServer.io `docker-ddclient` source at a published LinuxServer.io release;
-- an official published ddclient release selected through LinuxServer.io's existing `DDCLIENT_VERSION` mechanism;
-- a small project-owned final image layer used solely for independent branding, provenance metadata, and image identification.
+## Relationship to upstream projects
 
 Upstream projects:
 
 - [ddclient/ddclient](https://github.com/ddclient/ddclient)
 - [linuxserver/docker-ddclient](https://github.com/linuxserver/docker-ddclient)
 
-Issues specific to ddclient itself or the LinuxServer.io container should be reported to the corresponding upstream project.
-
-Issues specific to the automation, final-stage wrapper, or images published by this repository should be reported here.
+Issues in ddclient itself or the LinuxServer.io container should be reported to
+the respective upstream project. Issues in this project's automation, final
+wrapper, compliance tooling, or published derivative images belong here.
 
 ## License
 
-Original content in this repository is licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE).
+Original content in this repository is licensed under the **GNU General Public
+License v3.0**. See [LICENSE](LICENSE).
 
-Upstream software retains its original copyright and licensing:
+Upstream software retains its own copyright and license terms. In particular:
 
-- **LinuxServer.io docker-ddclient** — GNU General Public License v3.0
-- **ddclient** — GNU General Public License v2.0 or later
+- LinuxServer.io `docker-ddclient` — GNU GPL v3.0;
+- ddclient — GNU GPL v2.0 or later;
+- Alpine packages, s6-overlay components, Perl modules, and other included
+  software — their respective upstream licenses.
 
-The resulting Docker image also contains third-party software under additional licenses. The presence of this repository's GPL-3.0 license does not relicense those components.
-
-The SPDX SBOM is provided to improve transparency about components detected in the final image. It does not alter the license of any component and does not by itself replace source-code or notice obligations.
-
-Copyright and license terms of all upstream components remain with their respective copyright holders.
+The repository's GPL-3.0 license does not purport to relicense the complete
+multi-license container image.
 
 ## Disclaimer
 
-This is an independent project and is **not affiliated with, endorsed by, or maintained by LinuxServer.io or the ddclient project**.
+This is an independent project and is **not affiliated with, endorsed by, or
+maintained by LinuxServer.io or the ddclient project**.
 
-Pre-release versions of ddclient may contain bugs, regressions, or incomplete functionality.
-
-If stability is more important than access to the newest published ddclient release, consider using the official LinuxServer.io image or pin this image to a version that you have tested.
+Pre-release ddclient versions may contain bugs, regressions, or incomplete
+functionality. If stability is more important than following the newest
+published ddclient release, use an explicitly tested version or the official
+LinuxServer.io image.

@@ -9,6 +9,11 @@ ARG DDCLIENT_VERSION
 ARG LSIO_TAG
 ARG LSIO_COMMIT
 ARG PROJECT_COMMIT
+ARG COMPLIANCE_RELEASE
+ARG LSIO_BASE_IMAGE
+ARG LSIO_BASE_DIGEST
+ARG LSIO_BASE_RELEASE
+ARG LSIO_BASE_COMMIT
 
 ENV LSIO_FIRST_PARTY=false
 
@@ -25,17 +30,27 @@ LABEL maintainer="fwe86" \
       org.opencontainers.image.revision="${PROJECT_COMMIT}" \
       io.github.fwe86.ddclient.version="${DDCLIENT_VERSION}" \
       io.github.fwe86.linuxserver.release="${LSIO_TAG}" \
-      io.github.fwe86.linuxserver.revision="${LSIO_COMMIT}"
+      io.github.fwe86.linuxserver.revision="${LSIO_COMMIT}" \
+      io.github.fwe86.linuxserver.base.image="${LSIO_BASE_IMAGE}" \
+      io.github.fwe86.linuxserver.base.digest="${LSIO_BASE_DIGEST}" \
+      io.github.fwe86.linuxserver.base.release="${LSIO_BASE_RELEASE}" \
+      io.github.fwe86.linuxserver.base.revision="${LSIO_BASE_COMMIT}" \
+      io.github.fwe86.compliance.release="${COMPLIANCE_RELEASE}" \
+      io.github.fwe86.compliance.url="https://github.com/fwe86/docker-ddclient/releases/tag/${COMPLIANCE_RELEASE}"
 
+# LinuxServer.io explicitly requires downstream images to provide their own
+# branding.  Keep the path expected by the inherited s6 init service, but
+# replace the content with this project's identity.
 COPY root/etc/s6-overlay/s6-rc.d/init-adduser/branding \
      /etc/s6-overlay/s6-rc.d/init-adduser/branding
 
 RUN printf '%s\n' \
-      "fwe86/docker-ddclient version: ${IMAGE_VERSION}" \
-      "Build-date: ${BUILD_DATE}" \
-      "ddclient release: ${DDCLIENT_VERSION}" \
-      "LinuxServer.io docker-ddclient source: ${LSIO_TAG}" \
-      "LinuxServer.io source commit: ${LSIO_COMMIT}" \
-      "Project revision: ${PROJECT_COMMIT}" \
-      "Independent project; not affiliated with, endorsed by, or maintained by LinuxServer.io." \
+      "fwe86/docker-ddclient version:- ${IMAGE_VERSION}" \
+      "Build-date:- ${BUILD_DATE}" \
+      "ddclient version:- ${DDCLIENT_VERSION}" \
+      "LinuxServer.io docker-ddclient release:- ${LSIO_TAG}" \
+      "LinuxServer.io docker-ddclient revision:- ${LSIO_COMMIT}" \
+      "LinuxServer.io base release:- ${LSIO_BASE_RELEASE}" \
+      "LinuxServer.io base digest:- ${LSIO_BASE_DIGEST}" \
+      "Compliance source release:- ${COMPLIANCE_RELEASE}" \
       > /build_version
