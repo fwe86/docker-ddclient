@@ -1,0 +1,533 @@
+name: Backfill legacy image compliance
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Exact legacy image tag to backfill; leave empty for the current upstream combination"
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/backfill-compliance.yml"
+      - "scripts/collect_alpine_compliance.py"
+      - "scripts/collect_cpan_compliance.py"
+      - "scripts/collect_s6_component_sources.py"
+      - "COMPLIANCE.md"
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: docker-ddclient-compliance-backfill
+  cancel-in-progress: false
+
+env:
+  LSIO_REPOSITORY: linuxserver/docker-ddclient
+  DDCLIENT_REPOSITORY: ddclient/ddclient
+
+jobs:
+  backfill:
+    name: Backfill source for an already published exact image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout compliance tooling
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Determine legacy exact image tag
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE_TAG="${REQUESTED_TAG:-}"
+
+          if [[ -z "$IMAGE_TAG" ]]; then
+            LSIO_JSON=$(curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${LSIO_REPOSITORY}/releases/latest")
+            LSIO_TAG=$(jq -r '.tag_name' <<< "$LSIO_JSON")
+            [[ "$LSIO_TAG" =~ -ls([0-9]+)$ ]] || {
+              echo "ERROR: Unexpected LinuxServer.io release tag: ${LSIO_TAG}" >&2
+              exit 1
+            }
+            LSIO_BUILD="${BASH_REMATCH[1]}"
+
+            DDCLIENT_JSON=$(curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${DDCLIENT_REPOSITORY}/releases?per_page=100")
+            DDCLIENT_VERSION=$(jq -r '
+              [ .[] | select(.draft == false and .published_at != null) ]
+              | sort_by(.published_at)
+              | reverse
+              | .[0].tag_name
+            ' <<< "$DDCLIENT_JSON")
+            [[ -n "$DDCLIENT_VERSION" && "$DDCLIENT_VERSION" != "null" ]] || {
+              echo "ERROR: Could not determine latest published ddclient release." >&2
+              exit 1
+            }
+            IMAGE_TAG="${DDCLIENT_VERSION}-ls${LSIO_BUILD}"
+          fi
+
+          if [[ ! "$IMAGE_TAG" =~ ^v[^[:space:]]+-ls[0-9]+$ ]]; then
+            echo "ERROR: Refusing unexpected exact image tag: ${IMAGE_TAG}" >&2
+            exit 1
+          fi
+
+          {
+            echo "image_name=${IMAGE_NAME}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR for deterministic pull
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull exact distributed image and capture immutable digest
+        id: image
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.version.outputs.image_name }}
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
+          docker pull "$IMAGE_REF"
+
+          REPO_DIGEST=$(docker image inspect "$IMAGE_REF" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | grep -F "${IMAGE_NAME}@sha256:" | head -n1)
+          [[ -n "$REPO_DIGEST" ]] || {
+            echo "ERROR: No immutable RepoDigest found for ${IMAGE_REF}." >&2
+            exit 1
+          }
+          IMAGE_DIGEST="${REPO_DIGEST#*@}"
+          DIGEST_SHORT="${IMAGE_DIGEST#sha256:}"
+          DIGEST_SHORT="${DIGEST_SHORT:0:16}"
+
+          get_label() {
+            docker image inspect --format "{{ index .Config.Labels \"$1\" }}" "$IMAGE_REF"
+          }
+
+          DDCLIENT_VERSION=$(get_label io.github.fwe86.ddclient.version)
+          LSIO_TAG=$(get_label io.github.fwe86.linuxserver.release)
+          LSIO_COMMIT=$(get_label io.github.fwe86.linuxserver.revision)
+          PROJECT_COMMIT=$(get_label org.opencontainers.image.revision)
+
+          [[ -n "$DDCLIENT_VERSION" && "$DDCLIENT_VERSION" != '<no value>' ]] || {
+            echo "ERROR: Legacy image does not expose its ddclient version label." >&2
+            exit 1
+          }
+          [[ -n "$LSIO_TAG" && "$LSIO_TAG" != '<no value>' ]] || {
+            echo "ERROR: Legacy image does not expose its LinuxServer.io release label." >&2
+            exit 1
+          }
+          [[ -n "$LSIO_COMMIT" && "$LSIO_COMMIT" != '<no value>' ]] || {
+            echo "ERROR: Legacy image does not expose its LinuxServer.io revision label." >&2
+            exit 1
+          }
+          [[ -n "$PROJECT_COMMIT" && "$PROJECT_COMMIT" != '<no value>' ]] || {
+            echo "ERROR: Legacy image does not expose its project revision label." >&2
+            exit 1
+          }
+
+          # The old workflow used image-<exact-tag>.  Prefer that existing release
+          # because it is the location already documented for legacy consumers.
+          LEGACY_RELEASE="image-${IMAGE_TAG}"
+          if gh release view "$LEGACY_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            RELEASE_TAG="$LEGACY_RELEASE"
+            RELEASE_CREATED=false
+          else
+            RELEASE_TAG="legacy-source-${IMAGE_TAG}-${DIGEST_SHORT}"
+            RELEASE_CREATED=true
+          fi
+
+          WORK_DIR="${RUNNER_TEMP}/legacy-compliance"
+          SOURCE_DIR="${WORK_DIR}/release"
+          mkdir -p "$SOURCE_DIR"
+
+          {
+            echo "IMAGE_REF=${IMAGE_REF}"
+            echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
+            echo "DIGEST_SHORT=${DIGEST_SHORT}"
+            echo "DDCLIENT_VERSION=${DDCLIENT_VERSION}"
+            echo "LSIO_TAG=${LSIO_TAG}"
+            echo "LSIO_COMMIT=${LSIO_COMMIT}"
+            echo "PROJECT_COMMIT=${PROJECT_COMMIT}"
+            echo "RELEASE_TAG=${RELEASE_TAG}"
+            echo "RELEASE_CREATED=${RELEASE_CREATED}"
+            echo "WORK_DIR=${WORK_DIR}"
+            echo "SOURCE_DIR=${SOURCE_DIR}"
+          } >> "$GITHUB_ENV"
+
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_created=${RELEASE_CREATED}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this exact digest has already been backfilled
+        id: marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MARKER="legacy-${DIGEST_SHORT}-BACKFILL_SOURCE_INFO.txt"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$MARKER"; then
+            echo "This exact image digest has already been backfilled."
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Capture direct exact source and provenance
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="legacy-${DIGEST_SHORT}"
+
+          LSIO_REPO="${WORK_DIR}/linuxserver-ddclient"
+          git init -q "$LSIO_REPO"
+          git -C "$LSIO_REPO" remote add origin "https://github.com/${LSIO_REPOSITORY}.git"
+          git -C "$LSIO_REPO" fetch -q --depth=1 origin "refs/tags/${LSIO_TAG}:refs/tags/${LSIO_TAG}"
+          ACTUAL_LSIO_COMMIT=$(git -C "$LSIO_REPO" rev-list -n1 "$LSIO_TAG")
+          [[ "$ACTUAL_LSIO_COMMIT" == "$LSIO_COMMIT" ]] || {
+            echo "ERROR: Legacy image LSIO revision label does not match ${LSIO_TAG}." >&2
+            exit 1
+          }
+          git -C "$LSIO_REPO" archive --format=tar.gz \
+            --prefix="linuxserver-docker-ddclient-${LSIO_TAG}/" \
+            -o "${SOURCE_DIR}/${PREFIX}-linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
+            "$LSIO_TAG"
+          for candidate in LICENSE LICENSE.md COPYING COPYING.md; do
+            if git -C "$LSIO_REPO" cat-file -e "${LSIO_TAG}:${candidate}" 2>/dev/null; then
+              git -C "$LSIO_REPO" show "${LSIO_TAG}:${candidate}" \
+                > "${SOURCE_DIR}/${PREFIX}-LICENSE-linuxserver-docker-ddclient"
+              break
+            fi
+          done
+          [[ -s "${SOURCE_DIR}/${PREFIX}-LICENSE-linuxserver-docker-ddclient" ]] || {
+            echo "ERROR: LinuxServer.io license not found." >&2
+            exit 1
+          }
+
+          DD_REPO="${WORK_DIR}/ddclient"
+          git init -q "$DD_REPO"
+          git -C "$DD_REPO" remote add origin "https://github.com/${DDCLIENT_REPOSITORY}.git"
+          git -C "$DD_REPO" fetch -q --depth=1 origin \
+            "refs/tags/${DDCLIENT_VERSION}:refs/tags/${DDCLIENT_VERSION}"
+          DD_COMMIT=$(git -C "$DD_REPO" rev-list -n1 "$DDCLIENT_VERSION")
+          git -C "$DD_REPO" archive --format=tar.gz \
+            --prefix="ddclient-${DDCLIENT_VERSION}/" \
+            -o "${SOURCE_DIR}/${PREFIX}-ddclient-${DDCLIENT_VERSION}.tar.gz" \
+            "$DDCLIENT_VERSION"
+          git -C "$DD_REPO" show "${DDCLIENT_VERSION}:COPYING" \
+            > "${SOURCE_DIR}/${PREFIX}-LICENSE-ddclient"
+          git -C "$DD_REPO" show "${DDCLIENT_VERSION}:COPYRIGHT" \
+            > "${SOURCE_DIR}/${PREFIX}-COPYRIGHT-ddclient"
+
+          PROJECT_REPO="${WORK_DIR}/project-source"
+          git init -q "$PROJECT_REPO"
+          git -C "$PROJECT_REPO" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$PROJECT_REPO" fetch -q --depth=1 origin "$PROJECT_COMMIT"
+          FETCHED_PROJECT_COMMIT=$(git -C "$PROJECT_REPO" rev-parse FETCH_HEAD)
+          [[ "$FETCHED_PROJECT_COMMIT" == "$PROJECT_COMMIT" ]] || {
+            echo "ERROR: Could not fetch exact project revision ${PROJECT_COMMIT}." >&2
+            exit 1
+          }
+          git -C "$PROJECT_REPO" archive --format=tar.gz \
+            --prefix="fwe86-docker-ddclient-${PROJECT_COMMIT}/" \
+            -o "${SOURCE_DIR}/${PREFIX}-fwe86-docker-ddclient-${PROJECT_COMMIT}.tar.gz" \
+            "$PROJECT_COMMIT"
+
+          cat > "${SOURCE_DIR}/${PREFIX}-BACKFILL_SOURCE_INFO.txt" <<INFO
+          Compliance backfill for an image distributed before the source-before-binary workflow.
+
+          Image: ${IMAGE_REF}
+          Immutable image digest: ${IMAGE_DIGEST}
+          ddclient release: ${DDCLIENT_VERSION}
+          ddclient source commit: ${DD_COMMIT}
+          LinuxServer.io docker-ddclient release: ${LSIO_TAG}
+          LinuxServer.io docker-ddclient source commit: ${LSIO_COMMIT}
+          Project revision embedded in image: ${PROJECT_COMMIT}
+          Backfill workflow revision: ${GITHUB_SHA}
+          Backfill run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Alpine and CPAN source below are collected from the already-published
+          final image identified by the digest above.  They are therefore tied to
+          the actual distributed binary rather than reconstructed from a current
+          Dockerfile.
+          INFO
+
+      - name: Collect corresponding source for all installed Alpine packages
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP_OUT="${WORK_DIR}/alpine-output"
+          mkdir -p "$TMP_OUT"
+          python3 scripts/collect_alpine_compliance.py \
+            --image "$IMAGE_REF" \
+            --output "$TMP_OUT" \
+            --workspace "${WORK_DIR}/alpine-work"
+          for f in "$TMP_OUT"/*; do
+            mv "$f" "${SOURCE_DIR}/legacy-${DIGEST_SHORT}-$(basename "$f")"
+          done
+
+      - name: Collect exact CPAN source installed in legacy image
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP_OUT="${WORK_DIR}/cpan-output"
+          mkdir -p "$TMP_OUT"
+          python3 scripts/collect_cpan_compliance.py \
+            --image "$IMAGE_REF" \
+            --output "$TMP_OUT" \
+            --workspace "${WORK_DIR}/cpan-work"
+          for f in "$TMP_OUT"/*; do
+            mv "$f" "${SOURCE_DIR}/legacy-${DIGEST_SHORT}-$(basename "$f")"
+          done
+
+      - name: Determine and collect exact s6-overlay component source
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="legacy-${DIGEST_SHORT}"
+          S6_PATH=$(docker run --rm --entrypoint /bin/sh "$IMAGE_REF" -c '
+            readlink /package/admin/s6-overlay 2>/dev/null ||
+            find /package/admin -maxdepth 1 -type d -name "s6-overlay-*" -print 2>/dev/null | head -n1
+          ' | tail -n1)
+          S6_VERSION=$(sed -nE 's#.*s6-overlay-([0-9]+(\.[0-9]+)+).*#\1#p' <<< "$S6_PATH")
+          [[ -n "$S6_VERSION" ]] || {
+            echo "ERROR: Could not identify exact s6-overlay version from legacy image." >&2
+            exit 1
+          }
+
+          S6_REPO="${WORK_DIR}/s6-overlay"
+          git init -q "$S6_REPO"
+          git -C "$S6_REPO" remote add origin https://github.com/just-containers/s6-overlay.git
+          git -C "$S6_REPO" fetch -q --depth=1 origin \
+            "refs/tags/v${S6_VERSION}:refs/tags/v${S6_VERSION}"
+          S6_COMMIT=$(git -C "$S6_REPO" rev-list -n1 "v${S6_VERSION}")
+          git -C "$S6_REPO" archive --format=tar.gz \
+            --prefix="s6-overlay-v${S6_VERSION}/" \
+            -o "${SOURCE_DIR}/${PREFIX}-s6-overlay-v${S6_VERSION}.tar.gz" \
+            "v${S6_VERSION}"
+          for candidate in LICENSE LICENSE.md COPYING COPYING.md; do
+            if git -C "$S6_REPO" cat-file -e "v${S6_VERSION}:${candidate}" 2>/dev/null; then
+              git -C "$S6_REPO" show "v${S6_VERSION}:${candidate}" \
+                > "${SOURCE_DIR}/${PREFIX}-LICENSE-s6-overlay"
+              break
+            fi
+          done
+          [[ -s "${SOURCE_DIR}/${PREFIX}-LICENSE-s6-overlay" ]] || {
+            echo "ERROR: s6-overlay license not found." >&2
+            exit 1
+          }
+
+          TMP_OUT="${WORK_DIR}/s6-output"
+          mkdir -p "$TMP_OUT"
+          python3 scripts/collect_s6_component_sources.py \
+            --s6-repo "$S6_REPO" \
+            --output "$TMP_OUT" \
+            --workspace "${WORK_DIR}/s6-components"
+          for f in "$TMP_OUT"/*; do
+            mv "$f" "${SOURCE_DIR}/${PREFIX}-$(basename "$f")"
+          done
+
+          cat > "${SOURCE_DIR}/${PREFIX}-S6_SOURCE_INFO.txt" <<INFO
+          s6-overlay version detected from distributed image: ${S6_VERSION}
+          s6-overlay source commit: ${S6_COMMIT}
+          INFO
+
+      - name: Preserve source-form LinuxServer.io helper/config scripts from legacy image
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="legacy-${DIGEST_SHORT}"
+          ROOT="${WORK_DIR}/legacy-source-form"
+          mkdir -p "$ROOT/files"
+          CID=$(docker create "$IMAGE_REF")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+          for path in \
+            /docker-mods \
+            /etc/s6-overlay/s6-rc.d \
+            /etc/cont-init.d \
+            /etc/services.d \
+            /defaults \
+            /usr/bin/lsiown \
+            /usr/bin/with-contenv; do
+            target="$ROOT/files$path"
+            mkdir -p "$(dirname "$target")"
+            docker cp "$CID:$path" "$target" >/dev/null 2>&1 || true
+          done
+
+          MODS_REPO="${WORK_DIR}/docker-mods-license"
+          git init -q "$MODS_REPO"
+          git -C "$MODS_REPO" remote add origin https://github.com/linuxserver/docker-mods.git
+          git -C "$MODS_REPO" fetch -q --depth=1 origin mod-scripts
+          MODS_COMMIT=$(git -C "$MODS_REPO" rev-parse FETCH_HEAD)
+          if git -C "$MODS_REPO" cat-file -e "${MODS_COMMIT}:LICENSE" 2>/dev/null; then
+            git -C "$MODS_REPO" show "${MODS_COMMIT}:LICENSE" > "$ROOT/LICENSE-linuxserver-docker-mods"
+          else
+            echo "ERROR: Could not obtain linuxserver/docker-mods license." >&2
+            exit 1
+          fi
+
+          cat > "$ROOT/SOURCE_INFO.txt" <<INFO
+          Exact source-form scripts/configuration copied byte-for-byte from:
+          ${IMAGE_REF}
+          ${IMAGE_DIGEST}
+
+          linuxserver/docker-mods license provenance commit observed during backfill:
+          ${MODS_COMMIT}
+
+          These files supplement the archived LinuxServer.io source tree and the
+          exact component sources in this backfill.  Binary files, if any happen
+          to be present under a copied directory, do not replace corresponding
+          source supplied elsewhere in this release.
+          INFO
+
+          tar -C "$ROOT" -czf \
+            "${SOURCE_DIR}/${PREFIX}-legacy-source-form-files.tar.gz" .
+          trap - EXIT
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+
+      - name: Assemble legacy third-party license and notice bundle
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP_OUT="${WORK_DIR}/license-output"
+          mkdir -p "$TMP_OUT"
+          python3 scripts/assemble_license_bundle.py \
+            --source-dir "$SOURCE_DIR" \
+            --output "$TMP_OUT" \
+            --workspace "${WORK_DIR}/third-party-licenses" \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          for f in "$TMP_OUT"/*; do
+            mv "$f" "${SOURCE_DIR}/legacy-${DIGEST_SHORT}-$(basename "$f")"
+          done
+
+      - name: Generate SPDX SBOM for exact legacy digest
+        if: steps.marker.outputs.required == 'true'
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: ${{ steps.version.outputs.image_name }}:${{ steps.version.outputs.image_tag }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/legacy-compliance/release/SBOM.spdx.json
+          upload-artifact: false
+
+      - name: Finalize digest-specific backfill bundle
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="legacy-${DIGEST_SHORT}"
+          mv "${SOURCE_DIR}/SBOM.spdx.json" "${SOURCE_DIR}/${PREFIX}-SBOM.spdx.json"
+
+          jq -e '.spdxVersion and .SPDXID and .creationInfo and .packages' \
+            "${SOURCE_DIR}/${PREFIX}-SBOM.spdx.json" >/dev/null
+
+          (
+            cd "$SOURCE_DIR"
+            find . -maxdepth 1 -type f ! -name "${PREFIX}-BACKFILL_SHA256SUMS" \
+              -printf '%f\n' | sort | while read -r file; do
+              sha256sum "$file"
+            done > "${PREFIX}-BACKFILL_SHA256SUMS"
+          )
+
+          # GitHub release assets must remain below GitHub's 2 GiB per-file limit.
+          while IFS= read -r -d '' file; do
+            size=$(stat -c '%s' "$file")
+            if (( size >= 2147483648 )); then
+              echo "ERROR: Release asset exceeds GitHub's 2 GiB limit: $file ($size bytes)" >&2
+              exit 1
+            fi
+          done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -print0)
+
+      - name: Create fallback legacy source release if necessary
+        if: steps.marker.outputs.required == 'true' && steps.image.outputs.release_created == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="${WORK_DIR}/release-notes.md"
+          cat > "$NOTES" <<EOF_NOTES
+          # Legacy source-compliance backfill
+
+          This release supplies source/provenance material for the already-published image:
+
+          \`${IMAGE_REF}\`
+
+          Immutable digest: \`${IMAGE_DIGEST}\`
+
+          The material was generated from the final distributed image by the compliance backfill workflow.
+          EOF_NOTES
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Legacy compliance source: ${IMAGE_REF##*:}" \
+            --notes-file "$NOTES"
+
+      - name: Attach missing digest-specific source assets without overwriting history
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(mktemp)
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' > "$EXISTING"
+
+          uploaded=0
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if grep -Fxq "$name" "$EXISTING"; then
+              echo "Asset already exists; preserving it: $name"
+              continue
+            fi
+            gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY"
+            uploaded=$((uploaded + 1))
+          done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -print0 | sort -z)
+
+          echo "Uploaded ${uploaded} new source/compliance assets to ${RELEASE_TAG}."
+
+      - name: Verify backfill marker is publicly attached
+        if: steps.marker.outputs.required == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MARKER="legacy-${DIGEST_SHORT}-BACKFILL_SOURCE_INFO.txt"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -Fxq "$MARKER" || {
+              echo "ERROR: Backfill marker was not attached to ${RELEASE_TAG}." >&2
+              exit 1
+            }
+          echo "Backfill complete for ${IMAGE_REF}@${IMAGE_DIGEST}."

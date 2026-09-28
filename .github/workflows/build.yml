@@ -2,19 +2,16 @@ name: Build ddclient
 
 on:
   workflow_dispatch:
-    inputs:
-      force_build:
-        description: "Build even if this version already exists"
-        required: false
-        default: false
-        type: boolean
-
   schedule:
     - cron: "17 * * * *"
 
 permissions:
   contents: write
   packages: write
+
+concurrency:
+  group: docker-ddclient-publish
+  cancel-in-progress: false
 
 env:
   LSIO_REPOSITORY: linuxserver/docker-ddclient
@@ -32,16 +29,13 @@ jobs:
       lsio_tag: ${{ steps.versions.outputs.lsio_tag }}
       image_name: ${{ steps.image.outputs.image_name }}
       image_tag: ${{ steps.versions.outputs.image_tag }}
-
     steps:
       - name: Determine image name
         id: image
         shell: bash
         run: |
           set -euo pipefail
-
           IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
-
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "Image: ${IMAGE_NAME}"
 
@@ -53,30 +47,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Getting latest LinuxServer release..."
-
           LSIO_JSON=$(curl --fail --silent --show-error \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${LSIO_REPOSITORY}/releases/latest")
 
-          LSIO_TAG=$(echo "$LSIO_JSON" | jq -r '.tag_name')
-
+          LSIO_TAG=$(jq -r '.tag_name' <<< "$LSIO_JSON")
           if [[ -z "$LSIO_TAG" || "$LSIO_TAG" == "null" ]]; then
-            echo "ERROR: Could not determine latest LinuxServer release."
+            echo "ERROR: Could not determine latest LinuxServer.io release." >&2
             exit 1
           fi
-
           if [[ ! "$LSIO_TAG" =~ -ls([0-9]+)$ ]]; then
-            echo "ERROR: Unexpected LinuxServer release tag: ${LSIO_TAG}"
+            echo "ERROR: Unexpected LinuxServer.io release tag: ${LSIO_TAG}" >&2
             exit 1
           fi
-
           LSIO_BUILD="${BASH_REMATCH[1]}"
           LSIO_VERSION="${LSIO_TAG%-ls${LSIO_BUILD}}"
-
-          echo "Getting newest published ddclient release including prereleases..."
 
           DDCLIENT_JSON=$(curl --fail --silent --show-error \
             -H "Accept: application/vnd.github+json" \
@@ -84,146 +71,119 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${DDCLIENT_REPOSITORY}/releases?per_page=100")
 
-          DDCLIENT_VERSION=$(echo "$DDCLIENT_JSON" | jq -r \
-            '[.[] |
-                select(
-                  .draft == false and
-                  .published_at != null
-                )
-              ] |
-              sort_by(.published_at) |
-              reverse |
-              .[0].tag_name')
-
+          DDCLIENT_VERSION=$(jq -r '
+            [ .[] | select(.draft == false and .published_at != null) ]
+            | sort_by(.published_at)
+            | reverse
+            | .[0].tag_name
+          ' <<< "$DDCLIENT_JSON")
           if [[ -z "$DDCLIENT_VERSION" || "$DDCLIENT_VERSION" == "null" ]]; then
-            echo "ERROR: Could not determine latest ddclient release."
+            echo "ERROR: Could not determine latest published ddclient release." >&2
             exit 1
           fi
 
           IMAGE_TAG="${DDCLIENT_VERSION}-ls${LSIO_BUILD}"
+          {
+            echo "lsio_tag=${LSIO_TAG}"
+            echo "lsio_version=${LSIO_VERSION}"
+            echo "lsio_build=${LSIO_BUILD}"
+            echo "ddclient_version=${DDCLIENT_VERSION}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
 
-          echo
-          echo "Detected versions:"
-          echo "  LinuxServer release : ${LSIO_TAG}"
-          echo "  LinuxServer version : ${LSIO_VERSION}"
-          echo "  LinuxServer build   : ls${LSIO_BUILD}"
-          echo "  ddclient release    : ${DDCLIENT_VERSION}"
-          echo "  Resulting image tag : ${IMAGE_TAG}"
+          printf '%s\n' \
+            "LinuxServer.io: ${LSIO_TAG}" \
+            "ddclient:       ${DDCLIENT_VERSION}" \
+            "Image tag:      ${IMAGE_TAG}"
 
-          echo "lsio_tag=${LSIO_TAG}" >> "$GITHUB_OUTPUT"
-          echo "lsio_version=${LSIO_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "lsio_build=${LSIO_BUILD}" >> "$GITHUB_OUTPUT"
-          echo "ddclient_version=${DDCLIENT_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Check whether image already exists
+      - name: Enforce immutable exact image tag
         id: check_image
         shell: bash
         env:
           IMAGE_NAME: ${{ steps.image.outputs.image_name }}
           IMAGE_TAG: ${{ steps.versions.outputs.image_tag }}
-          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
         run: |
           set -euo pipefail
-
-          echo "Checking ${IMAGE_NAME}:${IMAGE_TAG}"
-
-          if [[ "$FORCE_BUILD" == "true" ]]; then
-            echo "Force build requested."
-            echo "build_required=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
+          echo "Checking immutable exact tag ${IMAGE_NAME}:${IMAGE_TAG}"
           if docker manifest inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "Image already exists."
-            echo "No build required."
+            echo "Exact image tag already exists; it will never be rebuilt or overwritten."
             echo "build_required=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Image does not exist."
-            echo "Build required."
+            echo "Exact image tag does not exist."
             echo "build_required=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
-    name: Build and publish image
+    name: Build, disclose source, then publish image
     needs: check
     if: needs.check.outputs.build_required == 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout LinuxServer release
-        uses: actions/checkout@v4
+      - name: Checkout exact LinuxServer.io release
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ env.LSIO_REPOSITORY }}
           ref: ${{ needs.check.outputs.lsio_tag }}
           fetch-depth: 0
 
-      - name: Verify LinuxServer checkout
+      - name: Verify LinuxServer.io checkout
         shell: bash
         env:
           EXPECTED_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
           set -euo pipefail
-
           ACTUAL_COMMIT=$(git rev-parse HEAD)
           TAG_COMMIT=$(git rev-list -n 1 "${EXPECTED_TAG}")
-
-          echo "Expected LinuxServer tag : ${EXPECTED_TAG}"
-          echo "Checked out commit       : ${ACTUAL_COMMIT}"
-          echo "Tag points to commit      : ${TAG_COMMIT}"
-
-          if [[ "${ACTUAL_COMMIT}" != "${TAG_COMMIT}" ]]; then
-            echo "ERROR: Checked out commit does not match LinuxServer tag ${EXPECTED_TAG}."
+          if [[ "$ACTUAL_COMMIT" != "$TAG_COMMIT" ]]; then
+            echo "ERROR: LinuxServer.io checkout does not match ${EXPECTED_TAG}." >&2
             exit 1
           fi
-
-          echo "LinuxServer checkout verified successfully."
-
           echo "LSIO_COMMIT=${ACTUAL_COMMIT}" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
 
       - name: Checkout project source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
           path: project
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Record project revision
+      - name: Initialize immutable build metadata
         shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
         run: |
           set -euo pipefail
-
           PROJECT_COMMIT=$(git -C project rev-parse HEAD)
-
-          if [[ "${PROJECT_COMMIT}" != "${GITHUB_SHA}" ]]; then
-            echo "ERROR: Project checkout does not match workflow commit."
-            echo "Expected: ${GITHUB_SHA}"
-            echo "Actual  : ${PROJECT_COMMIT}"
+          if [[ "$PROJECT_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "ERROR: Project checkout does not match workflow revision." >&2
             exit 1
           fi
 
-          echo "PROJECT_COMMIT=${PROJECT_COMMIT}" >> "$GITHUB_ENV"
-          echo "Project revision: ${PROJECT_COMMIT}"
+          SOURCE_DIR="${RUNNER_TEMP}/source"
+          COMPLIANCE_WORK="${RUNNER_TEMP}/compliance-work"
+          COMPLIANCE_RELEASE="image-${IMAGE_TAG}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$SOURCE_DIR" "$COMPLIANCE_WORK"
 
-      - name: Prepare corresponding source archives
+          {
+            echo "PROJECT_COMMIT=${PROJECT_COMMIT}"
+            echo "SOURCE_DIR=${SOURCE_DIR}"
+            echo "COMPLIANCE_WORK=${COMPLIANCE_WORK}"
+            echo "COMPLIANCE_RELEASE=${COMPLIANCE_RELEASE}"
+            echo "LOCAL_IMAGE=${IMAGE_NAME}:${IMAGE_TAG}"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare exact direct-source archives
         shell: bash
         env:
           LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
-          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
-          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
         run: |
           set -euo pipefail
-
-          SOURCE_DIR="${RUNNER_TEMP}/source"
-          DDCLIENT_EXTRACT_DIR="${RUNNER_TEMP}/ddclient-source"
-
-          mkdir -p "${SOURCE_DIR}"
-          mkdir -p "${DDCLIENT_EXTRACT_DIR}"
-
-          echo "Creating LinuxServer source archive..."
 
           git archive \
             --format=tar.gz \
@@ -231,167 +191,106 @@ jobs:
             --output="${SOURCE_DIR}/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
             "${LSIO_TAG}"
 
-          echo "Copying LinuxServer license..."
+          [[ -f LICENSE ]] || { echo "ERROR: LinuxServer.io LICENSE not found." >&2; exit 1; }
+          cp LICENSE "${SOURCE_DIR}/LICENSE-linuxserver-docker-ddclient"
+          cp Dockerfile "${SOURCE_DIR}/Dockerfile-linuxserver-original"
 
-          if [[ ! -f LICENSE ]]; then
-            echo "ERROR: LinuxServer LICENSE file not found."
+          DDCLIENT_REPO="${COMPLIANCE_WORK}/ddclient"
+          git init -q "$DDCLIENT_REPO"
+          git -C "$DDCLIENT_REPO" remote add origin "https://github.com/${DDCLIENT_REPOSITORY}.git"
+          git -C "$DDCLIENT_REPO" fetch -q --depth=1 origin \
+            "refs/tags/${DDCLIENT_VERSION}:refs/tags/${DDCLIENT_VERSION}"
+          DDCLIENT_COMMIT=$(git -C "$DDCLIENT_REPO" rev-list -n 1 "$DDCLIENT_VERSION")
+          git -C "$DDCLIENT_REPO" archive \
+            --format=tar.gz \
+            --prefix="ddclient-${DDCLIENT_VERSION}/" \
+            -o "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz" \
+            "$DDCLIENT_VERSION"
+          for file in COPYING COPYRIGHT; do
+            git -C "$DDCLIENT_REPO" cat-file -e "${DDCLIENT_VERSION}:${file}" 2>/dev/null || {
+              echo "ERROR: ddclient ${file} not found in ${DDCLIENT_VERSION}." >&2
+              exit 1
+            }
+            if [[ "$file" == "COPYING" ]]; then
+              target="${SOURCE_DIR}/LICENSE-ddclient"
+            else
+              target="${SOURCE_DIR}/COPYRIGHT-ddclient"
+            fi
+            git -C "$DDCLIENT_REPO" show "${DDCLIENT_VERSION}:${file}" > "$target"
+          done
+          echo "DDCLIENT_COMMIT=${DDCLIENT_COMMIT}" >> "$GITHUB_ENV"
+
+          git -C project archive \
+            --format=tar.gz \
+            --prefix="fwe86-docker-ddclient-${PROJECT_COMMIT}/" \
+            -o "${SOURCE_DIR}/fwe86-docker-ddclient-${PROJECT_COMMIT}.tar.gz" \
+            "$PROJECT_COMMIT"
+          [[ -f project/LICENSE ]] || { echo "ERROR: Project LICENSE not found." >&2; exit 1; }
+          cp project/LICENSE "${SOURCE_DIR}/LICENSE-fwe86-docker-ddclient"
+          cp project/Dockerfile "${SOURCE_DIR}/Dockerfile-final"
+          cp project/root/etc/s6-overlay/s6-rc.d/init-adduser/branding "${SOURCE_DIR}/branding"
+
+      - name: Pin LinuxServer.io moving base tag to immutable digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/scripts/pin_linuxserver_base.py \
+            --dockerfile Dockerfile \
+            --output "${COMPLIANCE_WORK}/Dockerfile.linuxserver-pinned" \
+            --metadata "${SOURCE_DIR}/LINUXSERVER_BASE_IMAGE.json" \
+            --github-env "$GITHUB_ENV"
+          cp "${COMPLIANCE_WORK}/Dockerfile.linuxserver-pinned" \
+            "${SOURCE_DIR}/Dockerfile-linuxserver-pinned"
+          diff -u Dockerfile "${COMPLIANCE_WORK}/Dockerfile.linuxserver-pinned" \
+            > "${SOURCE_DIR}/Dockerfile-linuxserver-base-pin.diff" || true
+
+          CHANGES=$(grep -Ec '^[+-]FROM ' "${SOURCE_DIR}/Dockerfile-linuxserver-base-pin.diff" || true)
+          if [[ "$CHANGES" -ne 2 ]]; then
+            echo "ERROR: Pinned Dockerfile differs by more than the expected FROM replacement." >&2
+            cat "${SOURCE_DIR}/Dockerfile-linuxserver-base-pin.diff" >&2
             exit 1
           fi
 
-          cp LICENSE \
-            "${SOURCE_DIR}/LICENSE-linuxserver-docker-ddclient"
+      - name: Collect LinuxServer.io base and overlay source
+        shell: bash
+        env:
+          WORK_DIR: ${{ runner.temp }}/base-compliance
+        run: |
+          set -euo pipefail
+          export BASE_IMAGE_PINNED="${LSIO_BASE_PINNED}"
+          export BASE_RELEASE="${LSIO_BASE_RELEASE}"
+          bash project/scripts/collect_base_compliance.sh
+          python3 project/scripts/collect_s6_component_sources.py \
+            --s6-repo "${WORK_DIR}/s6-overlay" \
+            --output "${SOURCE_DIR}" \
+            --workspace "${WORK_DIR}/s6-components"
 
-          echo "Downloading exact ddclient source archive..."
-
-          curl \
-            --fail \
-            --location \
-            --silent \
-            --show-error \
-            --output "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz" \
-            "https://github.com/${DDCLIENT_REPOSITORY}/archive/refs/tags/${DDCLIENT_VERSION}.tar.gz"
-
-          echo "Extracting ddclient license information..."
-
-          tar \
-            -xzf "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz" \
-            -C "${DDCLIENT_EXTRACT_DIR}"
-
-          DDCLIENT_SOURCE_ROOT=$(find "${DDCLIENT_EXTRACT_DIR}" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -print \
-            -quit)
-
-          if [[ -z "${DDCLIENT_SOURCE_ROOT}" ]]; then
-            echo "ERROR: Could not determine extracted ddclient source directory."
-            exit 1
-          fi
-
-          if [[ ! -f "${DDCLIENT_SOURCE_ROOT}/COPYING" ]]; then
-            echo "ERROR: ddclient COPYING file not found."
-            exit 1
-          fi
-
-          if [[ ! -f "${DDCLIENT_SOURCE_ROOT}/COPYRIGHT" ]]; then
-            echo "ERROR: ddclient COPYRIGHT file not found."
-            exit 1
-          fi
-
-          cp "${DDCLIENT_SOURCE_ROOT}/COPYING" \
-            "${SOURCE_DIR}/LICENSE-ddclient"
-
-          cp "${DDCLIENT_SOURCE_ROOT}/COPYRIGHT" \
-            "${SOURCE_DIR}/COPYRIGHT-ddclient"
-
-          echo "Copying project-owned final-image files..."
-
-          if [[ ! -f project/Dockerfile ]]; then
-            echo "ERROR: Project Dockerfile not found."
-            exit 1
-          fi
-
-          if [[ ! -f project/root/etc/s6-overlay/s6-rc.d/init-adduser/branding ]]; then
-            echo "ERROR: Project branding file not found."
-            exit 1
-          fi
-
-          cp project/Dockerfile \
-            "${SOURCE_DIR}/Dockerfile-final"
-
-          cp project/root/etc/s6-overlay/s6-rc.d/init-adduser/branding \
-            "${SOURCE_DIR}/branding"
-
-          echo "Creating source information..."
-
-          cat > "${SOURCE_DIR}/SOURCE_INFO.txt" <<EOF
-          Image:
-          ${IMAGE_NAME}:${IMAGE_TAG}
-
-          Direct upstream sources used by this build:
-
-          LinuxServer.io docker-ddclient
-          Repository: https://github.com/${LSIO_REPOSITORY}
-          Release: ${LSIO_TAG}
-          Commit: ${LSIO_COMMIT}
-          License: GPL-3.0
-          Source archive: linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz
-          License file: LICENSE-linuxserver-docker-ddclient
-
-          ddclient
-          Repository: https://github.com/${DDCLIENT_REPOSITORY}
-          Release: ${DDCLIENT_VERSION}
-          License: GPL-2.0-or-later
-          Source archive: ddclient-${DDCLIENT_VERSION}.tar.gz
-          License file: LICENSE-ddclient
-          Copyright file: COPYRIGHT-ddclient
-
-          Final image wrapper
-          Repository: https://github.com/${GITHUB_REPOSITORY}
-          Commit: ${PROJECT_COMMIT}
-          License: GPL-3.0
-          Build file: Dockerfile-final
-          Branding file: branding
-
-          The LinuxServer.io source archive preserves the exact upstream release
-          selected by this build and is built unchanged as an intermediate image.
-
-          Dockerfile-final and branding are the project-owned final-image layer
-          used to distinguish the independently published image from the
-          LinuxServer.io upstream image. The wrapper does not modify the archived
-          LinuxServer.io source tree.
-
-          The resulting container image additionally contains the LinuxServer.io
-          base image, Alpine Linux packages, Perl modules and other third-party
-          components. Those components remain subject to their respective
-          copyright and license terms.
-
-          SBOM.spdx.json inventories components detected in the final built image.
-          Because ddclient is installed outside Alpine's package metadata, the workflow
-          additionally records the exact version-verified ddclient release as an explicit
-          SPDX package and links it to the container with a CONTAINS relationship.
-
-          Publication of these source archives and license files does not
-          relicense any upstream component.
-          EOF
-
-          echo
-          echo "Prepared source and license files:"
-          ls -lh "${SOURCE_DIR}"
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build image
+      - name: Build LinuxServer.io upstream with pinned base digest
         shell: bash
         env:
           IMAGE_NAME: ${{ needs.check.outputs.image_name }}
           IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
-          LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
-          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
           set -euo pipefail
-
-          UPSTREAM_IMAGE="${IMAGE_NAME}:upstream-${IMAGE_TAG}"
-
-          echo "Building unchanged LinuxServer.io upstream source..."
-
+          UPSTREAM_IMAGE="${IMAGE_NAME}:local-upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker build \
-            --pull \
             --build-arg DDCLIENT_VERSION="${DDCLIENT_VERSION}" \
             --build-arg VERSION="${IMAGE_TAG}" \
             --build-arg BUILD_DATE="${BUILD_DATE}" \
-            -t "${UPSTREAM_IMAGE}" \
+            -f "${COMPLIANCE_WORK}/Dockerfile.linuxserver-pinned" \
+            -t "$UPSTREAM_IMAGE" \
             .
+          echo "UPSTREAM_IMAGE=${UPSTREAM_IMAGE}" >> "$GITHUB_ENV"
 
-          echo "Building independently branded final image..."
-
+      - name: Build independently branded final image
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
+        run: |
+          set -euo pipefail
           docker build \
             --build-arg UPSTREAM_IMAGE="${UPSTREAM_IMAGE}" \
             --build-arg IMAGE_VERSION="${IMAGE_TAG}" \
@@ -400,142 +299,122 @@ jobs:
             --build-arg LSIO_TAG="${LSIO_TAG}" \
             --build-arg LSIO_COMMIT="${LSIO_COMMIT}" \
             --build-arg PROJECT_COMMIT="${PROJECT_COMMIT}" \
+            --build-arg COMPLIANCE_RELEASE="${COMPLIANCE_RELEASE}" \
+            --build-arg LSIO_BASE_IMAGE="${LSIO_BASE_IMAGE}" \
+            --build-arg LSIO_BASE_DIGEST="${LSIO_BASE_DIGEST}" \
+            --build-arg LSIO_BASE_RELEASE="${LSIO_BASE_RELEASE}" \
+            --build-arg LSIO_BASE_COMMIT="${LSIO_BASE_COMMIT}" \
             -f project/Dockerfile \
-            -t "${IMAGE_NAME}:latest" \
-            -t "${IMAGE_NAME}:${DDCLIENT_VERSION}" \
-            -t "${IMAGE_NAME}:ls${LSIO_BUILD}" \
-            -t "${IMAGE_NAME}:${IMAGE_TAG}" \
+            -t "${LOCAL_IMAGE}" \
             project
 
-      - name: Verify image identity and branding
+      - name: Verify image identity, provenance and branding
         shell: bash
         env:
-          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
           IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
           LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
           set -euo pipefail
-
-          IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-
           get_label() {
-            docker image inspect \
-              --format "{{ index .Config.Labels \"$1\" }}" \
-              "${IMAGE}"
+            docker image inspect --format "{{ index .Config.Labels \"$1\" }}" "${LOCAL_IMAGE}"
           }
-
           assert_label() {
-            local key="$1"
-            local expected="$2"
-            local actual
-
-            actual="$(get_label "${key}")"
-
-            if [[ "${actual}" != "${expected}" ]]; then
-              echo "ERROR: Unexpected image label ${key}"
-              echo "Expected: ${expected}"
-              echo "Actual  : ${actual}"
+            local key="$1" expected="$2" actual
+            actual="$(get_label "$key")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "ERROR: Label ${key} mismatch." >&2
+              echo "Expected: ${expected}" >&2
+              echo "Actual:   ${actual}" >&2
               exit 1
             fi
           }
 
-          assert_label "maintainer" "fwe86"
-          assert_label "org.opencontainers.image.authors" "fwe86"
-          assert_label "org.opencontainers.image.vendor" "fwe86"
-          assert_label "org.opencontainers.image.title" "docker-ddclient"
-          assert_label "org.opencontainers.image.source" \
-            "https://github.com/${GITHUB_REPOSITORY}"
-          assert_label "org.opencontainers.image.version" "${IMAGE_TAG}"
-          assert_label "org.opencontainers.image.revision" "${PROJECT_COMMIT}"
-          assert_label "io.github.fwe86.ddclient.version" "${DDCLIENT_VERSION}"
-          assert_label "io.github.fwe86.linuxserver.release" "${LSIO_TAG}"
-          assert_label "io.github.fwe86.linuxserver.revision" "${LSIO_COMMIT}"
+          assert_label maintainer fwe86
+          assert_label org.opencontainers.image.authors fwe86
+          assert_label org.opencontainers.image.vendor fwe86
+          assert_label org.opencontainers.image.title docker-ddclient
+          assert_label org.opencontainers.image.source "https://github.com/${GITHUB_REPOSITORY}"
+          assert_label org.opencontainers.image.version "$IMAGE_TAG"
+          assert_label org.opencontainers.image.revision "$PROJECT_COMMIT"
+          assert_label io.github.fwe86.ddclient.version "$DDCLIENT_VERSION"
+          assert_label io.github.fwe86.linuxserver.release "$LSIO_TAG"
+          assert_label io.github.fwe86.linuxserver.revision "$LSIO_COMMIT"
+          assert_label io.github.fwe86.linuxserver.base.image "$LSIO_BASE_IMAGE"
+          assert_label io.github.fwe86.linuxserver.base.digest "$LSIO_BASE_DIGEST"
+          assert_label io.github.fwe86.linuxserver.base.release "$LSIO_BASE_RELEASE"
+          assert_label io.github.fwe86.linuxserver.base.revision "$LSIO_BASE_COMMIT"
+          assert_label io.github.fwe86.compliance.release "$COMPLIANCE_RELEASE"
+          assert_label io.github.fwe86.compliance.url \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${COMPLIANCE_RELEASE}"
+
+          if ! docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            "${LOCAL_IMAGE}" | grep -Fxq 'LSIO_FIRST_PARTY=false'; then
+            echo "ERROR: LSIO_FIRST_PARTY=false is not set." >&2
+            exit 1
+          fi
 
           BUILD_LABEL="$(get_label build_version)"
-
-          if grep -Fqi "Linuxserver.io version" <<< "${BUILD_LABEL}"; then
-            echo "ERROR: LinuxServer.io build branding is still present in build_version."
+          if grep -Fqi 'Linuxserver.io version' <<< "$BUILD_LABEL"; then
+            echo "ERROR: LinuxServer.io first-party build branding remains in build_version." >&2
             exit 1
           fi
+          grep -Fq 'fwe86/docker-ddclient version:' <<< "$BUILD_LABEL"
 
-          if ! grep -Fq "fwe86/docker-ddclient version:" <<< "${BUILD_LABEL}"; then
-            echo "ERROR: Project build_version label is missing."
-            exit 1
-          fi
+          BUILD_VERSION_CONTENT=$(docker run --rm --entrypoint cat "${LOCAL_IMAGE}" /build_version)
+          grep -Fq "fwe86/docker-ddclient version:- ${IMAGE_TAG}" <<< "$BUILD_VERSION_CONTENT"
+          grep -Fq "LinuxServer.io docker-ddclient release:- ${LSIO_TAG}" <<< "$BUILD_VERSION_CONTENT"
+          grep -Fq "LinuxServer.io base digest:- ${LSIO_BASE_DIGEST}" <<< "$BUILD_VERSION_CONTENT"
+          grep -Fq "Compliance source release:- ${COMPLIANCE_RELEASE}" <<< "$BUILD_VERSION_CONTENT"
 
-          if ! docker image inspect \
-            --format '{{range .Config.Env}}{{println .}}{{end}}' \
-            "${IMAGE}" | grep -Fxq 'LSIO_FIRST_PARTY=false'; then
-            echo "ERROR: LSIO_FIRST_PARTY=false is not set."
-            exit 1
-          fi
-
-          BUILD_VERSION_CONTENT=$(docker run --rm \
-            --entrypoint cat \
-            "${IMAGE}" \
-            /build_version)
-
-          echo "${BUILD_VERSION_CONTENT}"
-
-          if grep -Fqi "Linuxserver.io version:" <<< "${BUILD_VERSION_CONTENT}"; then
-            echo "ERROR: LinuxServer.io /build_version branding is still present."
-            exit 1
-          fi
-
-          if ! grep -Fq "fwe86/docker-ddclient version: ${IMAGE_TAG}" \
-            <<< "${BUILD_VERSION_CONTENT}"; then
-            echo "ERROR: Project /build_version identification is missing."
-            exit 1
-          fi
-
-          if ! grep -Fq "LinuxServer.io docker-ddclient source: ${LSIO_TAG}" \
-            <<< "${BUILD_VERSION_CONTENT}"; then
-            echo "ERROR: Upstream provenance is missing from /build_version."
-            exit 1
-          fi
-
-          BRANDING_CONTENT=$(docker run --rm \
-            --entrypoint cat \
-            "${IMAGE}" \
+          BRANDING_CONTENT=$(docker run --rm --entrypoint cat "${LOCAL_IMAGE}" \
             /etc/s6-overlay/s6-rc.d/init-adduser/branding)
-
-          echo "${BRANDING_CONTENT}"
-
-          if ! grep -Fq "fwe86/docker-ddclient" <<< "${BRANDING_CONTENT}"; then
-            echo "ERROR: Custom container branding is missing."
-            exit 1
-          fi
-
-          echo "Image identity and branding verified successfully."
+          grep -Fq 'fwe86/docker-ddclient' <<< "$BRANDING_CONTENT"
 
       - name: Verify ddclient version
         shell: bash
         env:
-          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
-          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
         run: |
           set -euo pipefail
-
-          OUTPUT=$(docker run --rm \
-            --entrypoint ddclient \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            --version)
-
-          echo "$OUTPUT"
-
+          OUTPUT=$(docker run --rm --entrypoint ddclient "${LOCAL_IMAGE}" --version)
           EXPECTED_VERSION="${DDCLIENT_VERSION#v}"
-
+          echo "$OUTPUT"
           if ! grep -Fq "ddclient version ${EXPECTED_VERSION}" <<< "$OUTPUT"; then
-            echo "ERROR: Built ddclient version does not match ${DDCLIENT_VERSION}."
+            echo "ERROR: Built ddclient version does not match ${DDCLIENT_VERSION}." >&2
             exit 1
           fi
 
-          echo "Verified ddclient ${EXPECTED_VERSION} successfully."
+      - name: Collect all installed Alpine package sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/scripts/collect_alpine_compliance.py \
+            --image "${LOCAL_IMAGE}" \
+            --output "${SOURCE_DIR}" \
+            --workspace "${COMPLIANCE_WORK}/alpine"
+
+      - name: Collect all installed CPAN distribution sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/scripts/collect_cpan_compliance.py \
+            --image "${LOCAL_IMAGE}" \
+            --output "${SOURCE_DIR}" \
+            --workspace "${COMPLIANCE_WORK}/cpan"
+
+      - name: Assemble convenient third-party license and notice bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/scripts/assemble_license_bundle.py \
+            --source-dir "${SOURCE_DIR}" \
+            --output "${SOURCE_DIR}" \
+            --workspace "${COMPLIANCE_WORK}/third-party-licenses" \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${COMPLIANCE_RELEASE}"
 
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.24.0
         with:
           image: ${{ needs.check.outputs.image_name }}:${{ needs.check.outputs.image_tag }}
           format: spdx-json
@@ -543,405 +422,379 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
-      - name: Add ddclient package to SPDX SBOM
+      - name: Add verified ddclient entry to SPDX SBOM
         shell: bash
         env:
-          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
-          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
         run: |
           set -euo pipefail
-
-          SBOM="${RUNNER_TEMP}/source/SBOM.spdx.json"
+          SBOM="${SOURCE_DIR}/SBOM.spdx.json"
           VERSION="${DDCLIENT_VERSION#v}"
-          NEW_DDCLIENT_SPDX_ID="SPDXRef-Package-ddclient-${VERSION//[^A-Za-z0-9.-]/-}"
+          [[ -s "$SBOM" ]] || { echo "ERROR: SBOM missing." >&2; exit 1; }
 
-          if [[ ! -s "${SBOM}" ]]; then
-            echo "ERROR: SBOM.spdx.json was not created or is empty."
-            exit 1
+          ROOT_SPDX_ID=$(jq -r --arg image "${LOCAL_IMAGE}" '
+            [ .packages[] | select(.name == $image or .name == ($image | split(":")[0])) | .SPDXID ][0] // empty
+          ' "$SBOM")
+          if [[ -z "$ROOT_SPDX_ID" ]]; then
+            ROOT_SPDX_ID=$(jq -r '.packages[0].SPDXID // empty' "$SBOM")
           fi
+          [[ -n "$ROOT_SPDX_ID" ]] || { echo "ERROR: Could not identify root package in SBOM." >&2; exit 1; }
 
-          ROOT_SPDX_ID=$(jq -r             --arg image "${IMAGE_NAME}"             --arg tag "${IMAGE_TAG}"             '[
-               .packages[] |
-               select(
-                 .name == $image and
-                 .versionInfo == $tag
-               ) |
-               .SPDXID
-             ][0] // empty'             "${SBOM}")
+          EXISTING_ID=$(jq -r --arg version "$VERSION" '
+            [ .packages[] | select(.name == "ddclient" and .versionInfo == $version) | .SPDXID ][0] // empty
+          ' "$SBOM")
+          DDCLIENT_ID="${EXISTING_ID:-SPDXRef-Package-ddclient-${VERSION//[^A-Za-z0-9.-]/-}}"
 
-          if [[ -z "${ROOT_SPDX_ID}" ]]; then
-            echo "ERROR: Could not identify the root container package in the SPDX SBOM."
-            exit 1
-          fi
-
-          if jq -e             --arg version "${VERSION}"             'any(
-               .packages[];
-               .name == "ddclient" and
-               .versionInfo == $version
-             )'             "${SBOM}" >/dev/null; then
-
-            echo "ddclient ${VERSION} is already present in the SBOM; enriching the existing package entry."
-
-            DDCLIENT_SPDX_ID=$(jq -r               --arg version "${VERSION}"               '[
-                 .packages[] |
-                 select(
-                   .name == "ddclient" and
-                   .versionInfo == $version
-                 ) |
-                 .SPDXID
-               ][0]'               "${SBOM}")
-
-            jq               --arg version "${VERSION}"               '
+          if [[ -n "$EXISTING_ID" ]]; then
+            jq --arg version "$VERSION" '
               .packages |= map(
                 if .name == "ddclient" and .versionInfo == $version then
                   . + {
-                    "downloadLocation": (
-                      "https://github.com/ddclient/ddclient/releases/tag/v" + $version
-                    ),
-                    "homepage": "https://github.com/ddclient/ddclient",
-                    "filesAnalyzed": false,
-                    "licenseConcluded": "GPL-2.0-or-later",
-                    "licenseDeclared": "GPL-2.0-or-later",
-                    "primaryPackagePurpose": "APPLICATION",
-                    "sourceInfo": (
-                      "Package metadata confirmed by the docker-ddclient build workflow " +
-                      "from the exact ddclient release selected for this image. The built " +
-                      "container was independently verified to report ddclient version " +
-                      $version + "."
-                    )
+                    downloadLocation: ("https://github.com/ddclient/ddclient/releases/tag/v" + $version),
+                    homepage: "https://github.com/ddclient/ddclient",
+                    filesAnalyzed: false,
+                    licenseConcluded: "GPL-2.0-or-later",
+                    licenseDeclared: "GPL-2.0-or-later",
+                    primaryPackagePurpose: "APPLICATION"
                   }
-                else
-                  .
-                end
+                else . end
               )
-              '               "${SBOM}" > "${SBOM}.tmp"
-
-            mv "${SBOM}.tmp" "${SBOM}"
+            ' "$SBOM" > "${SBOM}.tmp"
           else
-            echo "Adding explicitly verified ddclient ${VERSION} package metadata to the SBOM."
+            jq --arg id "$DDCLIENT_ID" --arg version "$VERSION" '
+              .packages += [{
+                SPDXID: $id,
+                name: "ddclient",
+                versionInfo: $version,
+                downloadLocation: ("https://github.com/ddclient/ddclient/releases/tag/v" + $version),
+                homepage: "https://github.com/ddclient/ddclient",
+                filesAnalyzed: false,
+                licenseConcluded: "GPL-2.0-or-later",
+                licenseDeclared: "GPL-2.0-or-later",
+                copyrightText: "NOASSERTION",
+                primaryPackagePurpose: "APPLICATION"
+              }]
+            ' "$SBOM" > "${SBOM}.tmp"
+          fi
+          mv "${SBOM}.tmp" "$SBOM"
 
-            DDCLIENT_SPDX_ID="${NEW_DDCLIENT_SPDX_ID}"
-
-            jq               --arg id "${DDCLIENT_SPDX_ID}"               --arg version "${VERSION}"               '
-              .packages += [
-                {
-                  "SPDXID": $id,
-                  "name": "ddclient",
-                  "versionInfo": $version,
-                  "downloadLocation": (
-                    "https://github.com/ddclient/ddclient/releases/tag/v" + $version
-                  ),
-                  "homepage": "https://github.com/ddclient/ddclient",
-                  "filesAnalyzed": false,
-                  "licenseConcluded": "GPL-2.0-or-later",
-                  "licenseDeclared": "GPL-2.0-or-later",
-                  "copyrightText": "NOASSERTION",
-                  "primaryPackagePurpose": "APPLICATION",
-                  "externalRefs": [
-                    {
-                      "referenceCategory": "PACKAGE-MANAGER",
-                      "referenceType": "purl",
-                      "referenceLocator": (
-                        "pkg:github/ddclient/ddclient@" + $version
-                      )
-                    }
-                  ],
-                  "sourceInfo": (
-                    "Explicitly added by the docker-ddclient build workflow from " +
-                    "the exact ddclient release selected for this image. The built " +
-                    "container was independently verified to report ddclient version " +
-                    $version + "."
-                  )
-                }
-              ]
-              '               "${SBOM}" > "${SBOM}.tmp"
-
-            mv "${SBOM}.tmp" "${SBOM}"
+          if ! jq -e --arg root "$ROOT_SPDX_ID" --arg ddclient "$DDCLIENT_ID" '
+            any((.relationships // [])[];
+              .spdxElementId == $root and
+              .relationshipType == "CONTAINS" and
+              .relatedSpdxElement == $ddclient)
+          ' "$SBOM" >/dev/null; then
+            jq --arg root "$ROOT_SPDX_ID" --arg ddclient "$DDCLIENT_ID" '
+              .relationships = ((.relationships // []) + [{
+                spdxElementId: $root,
+                relationshipType: "CONTAINS",
+                relatedSpdxElement: $ddclient,
+                comment: "ddclient is the primary application and its version was independently verified by the build workflow."
+              }])
+            ' "$SBOM" > "${SBOM}.tmp"
+            mv "${SBOM}.tmp" "$SBOM"
           fi
 
-          if ! jq -e             --arg root "${ROOT_SPDX_ID}"             --arg ddclient "${DDCLIENT_SPDX_ID}"             'any(
-               (.relationships // [])[];
-               .spdxElementId == $root and
-               .relationshipType == "CONTAINS" and
-               .relatedSpdxElement == $ddclient
-             )'             "${SBOM}" >/dev/null; then
+          jq -e --arg version "$VERSION" '
+            [ .packages[] | select(
+              .name == "ddclient" and
+              .versionInfo == $version and
+              .licenseDeclared == "GPL-2.0-or-later" and
+              .licenseConcluded == "GPL-2.0-or-later"
+            ) ] | length == 1
+          ' "$SBOM" >/dev/null
 
-            jq               --arg root "${ROOT_SPDX_ID}"               --arg ddclient "${DDCLIENT_SPDX_ID}"               '
-              .relationships = (
-                (.relationships // []) +
-                [
-                  {
-                    "spdxElementId": $root,
-                    "relationshipType": "CONTAINS",
-                    "relatedSpdxElement": $ddclient,
-                    "comment": (
-                      "ddclient is the primary application installed in this container " +
-                      "and was explicitly version-verified by the build workflow."
-                    )
-                  }
-                ]
-              )
-              '               "${SBOM}" > "${SBOM}.tmp"
-
-            mv "${SBOM}.tmp" "${SBOM}"
-          fi
-
-          echo "ddclient SPDX package entry and container relationship are present."
-
-      - name: Upload final SPDX SBOM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SBOM-${{ needs.check.outputs.image_tag }}.spdx.json
-          path: ${{ runner.temp }}/source/SBOM.spdx.json
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Verify SBOM and create checksums
+      - name: Create complete compliance manifest
         shell: bash
         env:
-          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
-          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
           IMAGE_NAME: ${{ needs.check.outputs.image_name }}
           IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
           set -euo pipefail
 
-          SOURCE_DIR="${RUNNER_TEMP}/source"
+          LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "${LOCAL_IMAGE}")
+          cat > "${SOURCE_DIR}/SOURCE_INFO.txt" <<EOF
+          Intended image: ${IMAGE_NAME}:${IMAGE_TAG}
+          Local image ID before publication: ${LOCAL_IMAGE_ID}
+          Compliance release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${COMPLIANCE_RELEASE}
 
-          if [[ ! -s "${SOURCE_DIR}/SBOM.spdx.json" ]]; then
-            echo "ERROR: SBOM.spdx.json was not created or is empty."
-            exit 1
-          fi
+          Project wrapper:
+            Repository: https://github.com/${GITHUB_REPOSITORY}
+            Commit: ${PROJECT_COMMIT}
+            License: GPL-3.0
 
-          if ! jq -e '.spdxVersion and .packages' \
-            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
-            echo "ERROR: SBOM.spdx.json is not a valid SPDX JSON document."
-            exit 1
-          fi
+          LinuxServer.io docker-ddclient:
+            Repository: https://github.com/${LSIO_REPOSITORY}
+            Release: ${LSIO_TAG}
+            Commit: ${LSIO_COMMIT}
+            License: GPL-3.0
 
-          EXPECTED_VERSION="${DDCLIENT_VERSION#v}"
+          ddclient:
+            Repository: https://github.com/${DDCLIENT_REPOSITORY}
+            Release: ${DDCLIENT_VERSION}
+            Commit: ${DDCLIENT_COMMIT}
+            License: GPL-2.0-or-later
 
-          if ! jq -e \
-            --arg version "${EXPECTED_VERSION}" \
-            '
-            [
-              .packages[] |
-              select(
-                .name == "ddclient" and
-                .versionInfo == $version and
-                .licenseDeclared == "GPL-2.0-or-later" and
-                .licenseConcluded == "GPL-2.0-or-later"
-              )
-            ] |
-            length == 1
-            ' \
-            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
-            echo "ERROR: Exactly one verified ddclient ${EXPECTED_VERSION} package entry is required in the final SPDX SBOM."
-            exit 1
-          fi
+          LinuxServer.io base image:
+            Original reference: ${LSIO_BASE_IMAGE}
+            Pinned reference: ${LSIO_BASE_PINNED}
+            Digest: ${LSIO_BASE_DIGEST}
+            Source release: ${LSIO_BASE_RELEASE}
+            Source commit: ${LSIO_BASE_COMMIT}
 
-          if ! jq -e \
-            --arg image "${IMAGE_NAME}" \
-            --arg tag "${IMAGE_TAG}" \
-            --arg version "${EXPECTED_VERSION}" \
-            '
-            ([.packages[] |
-               select(
-                 .name == $image and
-                 .versionInfo == $tag
-               )
-             ][0].SPDXID) as $root |
+          s6-overlay:
+            Release: v${S6_OVERLAY_VERSION}
+            Source commit: ${S6_OVERLAY_COMMIT}
 
-            ([.packages[] |
-               select(
-                 .name == "ddclient" and
-                 .versionInfo == $version
-               )
-             ][0].SPDXID) as $ddclient |
+          Compliance policy:
+          - The exact LinuxServer.io source release is archived.
+          - Its moving base-image tag is mechanically replaced with the recorded immutable digest before build.
+          - All APK packages actually installed in the final image are inventoried from /lib/apk/db/installed.
+          - For every installed Alpine source package, the exact aports package directory at its recorded commit and all remote source inputs fetched/verified by abuild are archived.
+          - CPAN distributions are discovered from installed .packlist files and their exact installed versions are archived from MetaCPAN.
+          - LinuxServer.io base source, s6-overlay source, exact embedded helper scripts, the project wrapper, ddclient source, a consolidated third-party license/notice convenience bundle, and an SPDX SBOM are included.
+          - This source release is published and verified before the container image is pushed.
+          - Exact image tags are immutable; the workflow has no force-rebuild path.
+          EOF
+          sed -i 's/^          //' "${SOURCE_DIR}/SOURCE_INFO.txt"
 
-            ($root != null) and
-            ($ddclient != null) and
-            any(
-              (.relationships // [])[];
-              .spdxElementId == $root and
-              .relationshipType == "CONTAINS" and
-              .relatedSpdxElement == $ddclient
-            )
-            ' \
-            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
-            echo "ERROR: The final SPDX SBOM does not link the container package to ddclient."
-            exit 1
-          fi
+          jq -n \
+            --arg image "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --arg project_commit "$PROJECT_COMMIT" \
+            --arg lsio_tag "$LSIO_TAG" \
+            --arg lsio_commit "$LSIO_COMMIT" \
+            --arg ddclient_version "$DDCLIENT_VERSION" \
+            --arg ddclient_commit "$DDCLIENT_COMMIT" \
+            --arg base_original "$LSIO_BASE_IMAGE" \
+            --arg base_pinned "$LSIO_BASE_PINNED" \
+            --arg base_digest "$LSIO_BASE_DIGEST" \
+            --arg base_release "$LSIO_BASE_RELEASE" \
+            --arg base_commit "$LSIO_BASE_COMMIT" \
+            --arg compliance_release "$COMPLIANCE_RELEASE" \
+            '{
+              image: $image,
+              project_commit: $project_commit,
+              linuxserver: {release: $lsio_tag, commit: $lsio_commit},
+              ddclient: {release: $ddclient_version, commit: $ddclient_commit},
+              linuxserver_base: {
+                original_reference: $base_original,
+                pinned_reference: $base_pinned,
+                digest: $base_digest,
+                source_release: $base_release,
+                source_commit: $base_commit
+              },
+              compliance_release: $compliance_release
+            }' > "${SOURCE_DIR}/BUILD_INPUTS.json"
 
-          echo "Verified ddclient ${EXPECTED_VERSION} package metadata in final SPDX SBOM."
+          cat > "${SOURCE_DIR}/RELEASE_NOTES.md" <<EOF
+          ## Compliance source for ${IMAGE_NAME}:${IMAGE_TAG}
+
+          This release is created **before** the corresponding container image is published.
+          The final image embeds a label pointing back to this release.
+
+          Included material covers the project wrapper, exact LinuxServer.io docker-ddclient
+          source, ddclient source, the pinned LinuxServer.io base-image provenance and source,
+          s6-overlay, exact source-form LinuxServer.io helper scripts, source inputs for every
+          Alpine package actually installed in the final image, installed CPAN distributions,
+          a consolidated third-party license/notice convenience bundle, an SPDX SBOM, and
+          SHA-256 checksums.
+
+          `SOURCE_INFO.txt` and `BUILD_INPUTS.json` provide the build-to-source mapping.
+          `IMAGE_DIGESTS.txt` is attached after the immutable exact image tag has been pushed.
+          EOF
+          sed -i 's/^          //' "${SOURCE_DIR}/RELEASE_NOTES.md"
+
+          find "${SOURCE_DIR}" -maxdepth 1 -type f -printf '%s %p\n' | sort -n
+          while IFS= read -r file; do
+            size=$(stat -c '%s' "$file")
+            if (( size >= 2000000000 )); then
+              echo "ERROR: Release asset exceeds the conservative 2 GB GitHub asset limit: $file ($size bytes)" >&2
+              exit 1
+            fi
+          done < <(find "${SOURCE_DIR}" -maxdepth 1 -type f -print)
 
           (
             cd "${SOURCE_DIR}"
-
-            sha256sum \
-              "linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
-              "ddclient-${DDCLIENT_VERSION}.tar.gz" \
-              "LICENSE-linuxserver-docker-ddclient" \
-              "LICENSE-ddclient" \
-              "COPYRIGHT-ddclient" \
-              "Dockerfile-final" \
-              "branding" \
-              "SOURCE_INFO.txt" \
-              "SBOM.spdx.json" \
-              > SHA256SUMS
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+              | LC_ALL=C sort \
+              | xargs -r sha256sum > SHA256SUMS
+            sha256sum -c SHA256SUMS
           )
 
-          echo
-          echo "Final release assets:"
-          ls -lh "${SOURCE_DIR}"
-          echo
-          echo "Checksums:"
-          cat "${SOURCE_DIR}/SHA256SUMS"
-
-      - name: Push images
-        shell: bash
-        env:
-          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
-          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
-          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
-          LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
-        run: |
-          set -euo pipefail
-
-          docker push "${IMAGE_NAME}:latest"
-          docker push "${IMAGE_NAME}:${DDCLIENT_VERSION}"
-          docker push "${IMAGE_NAME}:ls${LSIO_BUILD}"
-          docker push "${IMAGE_NAME}:${IMAGE_TAG}"
-
-      - name: Publish source release
+      - name: Publish immutable compliance source release before image
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           IMAGE_NAME: ${{ needs.check.outputs.image_name }}
-          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
-          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
         run: |
           set -euo pipefail
 
-          SOURCE_DIR="${RUNNER_TEMP}/source"
-          RELEASE_TAG="image-${IMAGE_TAG}"
-          RELEASE_TITLE="${IMAGE_TAG}"
-
-          cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
-          Docker image:
-
-          \`${IMAGE_NAME}:${IMAGE_TAG}\`
-
-          Upstream versions:
-
-          - ddclient: \`${DDCLIENT_VERSION}\`
-          - LinuxServer.io docker-ddclient: \`${LSIO_TAG}\`
-
-          ## Source and compliance material
-
-          The attached archives contain the exact ddclient and LinuxServer.io
-          docker-ddclient source versions selected by this build.
-
-          \`Dockerfile-final\` and \`branding\` are the exact project-owned
-          final-image files used to distinguish this independently published image
-          from LinuxServer.io.
-
-          \`SBOM.spdx.json\` is an SPDX JSON software bill of materials generated
-          from the final built container image. Because ddclient is installed outside
-          Alpine's package metadata, the workflow additionally records the exact
-          version-verified ddclient release as an explicit SPDX package.
-
-          \`SHA256SUMS\` contains checksums for all attached source, license,
-          copyright, wrapper, provenance, and SBOM files.
-
-          The Docker image also contains third-party packages from the
-          LinuxServer.io Alpine base image and Alpine repositories. Those
-          components remain subject to their respective licenses.
-
-          This is an independent project and is not affiliated with, endorsed by,
-          or maintained by LinuxServer.io or the ddclient project.
-          EOF
-
-          ASSETS=(
-            "${SOURCE_DIR}/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz"
-            "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz"
-            "${SOURCE_DIR}/LICENSE-linuxserver-docker-ddclient"
-            "${SOURCE_DIR}/LICENSE-ddclient"
-            "${SOURCE_DIR}/COPYRIGHT-ddclient"
-            "${SOURCE_DIR}/Dockerfile-final"
-            "${SOURCE_DIR}/branding"
-            "${SOURCE_DIR}/SOURCE_INFO.txt"
-            "${SOURCE_DIR}/SBOM.spdx.json"
-            "${SOURCE_DIR}/SHA256SUMS"
-          )
-
-          if gh release view "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-
-            echo "Release ${RELEASE_TAG} already exists."
-
-            gh release edit "${RELEASE_TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${RELEASE_TITLE}" \
-              --notes-file "${RUNNER_TEMP}/release-notes.md"
-
-            gh release upload "${RELEASE_TAG}" \
-              "${ASSETS[@]}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --clobber
-          else
-            gh release create "${RELEASE_TAG}" \
-              "${ASSETS[@]}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${RELEASE_TITLE}" \
-              --notes-file "${RUNNER_TEMP}/release-notes.md"
+          if gh release view "$COMPLIANCE_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "ERROR: Compliance release ${COMPLIANCE_RELEASE} already exists; refusing to overwrite it." >&2
+            exit 1
           fi
 
-      - name: Checkout own repository for state update
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.repository.default_branch }}
-          path: repository
-          token: ${{ secrets.GITHUB_TOKEN }}
+          mapfile -t ASSETS < <(find "$SOURCE_DIR" -maxdepth 1 -type f -print | LC_ALL=C sort)
+          (( ${#ASSETS[@]} > 0 )) || { echo "ERROR: No compliance assets prepared." >&2; exit 1; }
 
-      - name: Update upstream state
+          gh release create "$COMPLIANCE_RELEASE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$PROJECT_COMMIT" \
+            --title "Compliance source for ${IMAGE_TAG}" \
+            --notes-file "${SOURCE_DIR}/RELEASE_NOTES.md" \
+            --prerelease \
+            "${ASSETS[@]}"
+
+          EXPECTED=${#ASSETS[@]}
+          ACTUAL=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/releases/tags/${COMPLIANCE_RELEASE}" \
+            --jq '.assets | length')
+          if [[ "$ACTUAL" -ne "$EXPECTED" ]]; then
+            echo "ERROR: Compliance release contains ${ACTUAL} assets, expected ${EXPECTED}." >&2
+            exit 1
+          fi
+
+          RELEASE_URL=$(gh release view "$COMPLIANCE_RELEASE" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')
+          [[ -n "$RELEASE_URL" ]] || { echo "ERROR: Compliance release is not retrievable." >&2; exit 1; }
+          echo "Verified source release: ${RELEASE_URL}"
+
+      - name: Login to GHCR only after source disclosure
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish mutable aliases, then immutable exact image tag
+        id: push
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
+        run: |
+          set -euo pipefail
+
+          if docker manifest inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "ERROR: Exact tag appeared during the build; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          for alias in latest "$DDCLIENT_VERSION" "ls${LSIO_BUILD}"; do
+            docker tag "$LOCAL_IMAGE" "${IMAGE_NAME}:${alias}"
+            docker push "${IMAGE_NAME}:${alias}"
+          done
+
+          docker tag "$LOCAL_IMAGE" "${IMAGE_NAME}:${IMAGE_TAG}"
+          PUSH_LOG="${RUNNER_TEMP}/exact-push.log"
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}" 2>&1 | tee "$PUSH_LOG"
+
+          IMAGE_DIGEST=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$PUSH_LOG" | tail -n1)
+          if [[ -z "$IMAGE_DIGEST" ]]; then
+            IMAGE_DIGEST=$(docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_TAG}" \
+              | awk '$1 == "Digest:" {print $2; exit}')
+          fi
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "ERROR: Could not determine published image digest." >&2
+            exit 1
+          }
+
+          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Attach registry digest to immutable compliance release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/IMAGE_DIGESTS.txt" <<EOF
+          ${IMAGE_NAME}:${IMAGE_TAG} = ${IMAGE_DIGEST}
+          ${IMAGE_NAME}:latest = mutable alias; inspect registry for current digest
+          ${IMAGE_NAME}:${{ needs.check.outputs.ddclient_version }} = mutable alias
+          ${IMAGE_NAME}:ls${{ needs.check.outputs.lsio_build }} = mutable alias
+          EOF
+          sed -i 's/^          //' "${RUNNER_TEMP}/IMAGE_DIGESTS.txt"
+
+          for attempt in 1 2 3; do
+            if gh release upload "$COMPLIANCE_RELEASE" \
+              "${RUNNER_TEMP}/IMAGE_DIGESTS.txt" \
+              --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            echo "Digest-asset upload attempt ${attempt} failed." >&2
+            sleep $((attempt * 5))
+          done
+          echo "ERROR: The image is published and source was already disclosed, but IMAGE_DIGESTS.txt could not be attached." >&2
+          exit 1
+
+      - name: Update tracked upstream state after successful publication
         shell: bash
         env:
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
-          LSIO_RELEASE: ${{ needs.check.outputs.lsio_tag }}
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
+          LSIO_VERSION: ${{ needs.check.outputs.lsio_version }}
           LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
-          IMAGE_VERSION: ${{ needs.check.outputs.image_tag }}
           IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
         run: |
           set -euo pipefail
 
-          cd repository
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
+            echo "ERROR: Refusing to update .upstream from a non-branch workflow run." >&2
+            exit 1
+          fi
 
-          cat > .upstream <<EOF
+          cat > project/.upstream <<EOF
           DDCLIENT_VERSION=${DDCLIENT_VERSION}
-          LSIO_RELEASE=${LSIO_RELEASE}
-          LSIO_BUILD=ls${LSIO_BUILD}
-          IMAGE=${IMAGE_NAME}
-          IMAGE_VERSION=${IMAGE_VERSION}
-          SOURCE_RELEASE=image-${IMAGE_VERSION}
+          DDCLIENT_COMMIT=${DDCLIENT_COMMIT}
+          LSIO_RELEASE=${LSIO_TAG}
+          LSIO_VERSION=${LSIO_VERSION}
+          LSIO_BUILD=${LSIO_BUILD}
+          LSIO_COMMIT=${LSIO_COMMIT}
+          LSIO_BASE_IMAGE=${LSIO_BASE_IMAGE}
+          LSIO_BASE_DIGEST=${LSIO_BASE_DIGEST}
+          LSIO_BASE_RELEASE=${LSIO_BASE_RELEASE}
+          LSIO_BASE_COMMIT=${LSIO_BASE_COMMIT}
+          IMAGE=${IMAGE_NAME}:${IMAGE_TAG}
+          IMAGE_DIGEST=${IMAGE_DIGEST}
+          COMPLIANCE_RELEASE=${COMPLIANCE_RELEASE}
+          PROJECT_REVISION=${PROJECT_COMMIT}
           EOF
+          sed -i 's/^          //' project/.upstream
 
-          echo "New .upstream:"
-          cat .upstream
-
-          if git diff --quiet -- .upstream && \
-             git ls-files --error-unmatch .upstream >/dev/null 2>&1; then
-            echo ".upstream is already current."
+          if git -C project diff --quiet -- .upstream; then
+            echo ".upstream already contains the published state."
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C project config user.name github-actions[bot]
+          git -C project config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C project add .upstream
+          git -C project commit -m "chore: record ${IMAGE_TAG} publication"
+          git -C project push origin "HEAD:${GITHUB_REF_NAME}"
 
-          git add .upstream
-          git commit -m "Update upstream state to ${IMAGE_VERSION}"
-          git push
+      - name: Publication summary
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Published"
+            echo
+            echo "- Image: \`${IMAGE_NAME}:${IMAGE_TAG}\`"
+            echo "- Digest: \`${IMAGE_DIGEST}\`"
+            echo "- Compliance release: \`${COMPLIANCE_RELEASE}\`"
+            echo "- LinuxServer.io base digest: \`${LSIO_BASE_DIGEST}\`"
+            echo
+            echo "The source/compliance release was created and verified before the image was pushed."
+          } >> "$GITHUB_STEP_SUMMARY"
