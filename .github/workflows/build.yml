@@ -348,6 +348,9 @@ jobs:
           copyright and license terms.
 
           SBOM.spdx.json inventories components detected in the final built image.
+          Because ddclient is installed outside Alpine's package metadata, the workflow
+          additionally records the exact version-verified ddclient release as an explicit
+          SPDX package and links it to the container with a CONTAINS relationship.
 
           Publication of these source archives and license files does not
           relicense any upstream component.
@@ -537,15 +540,170 @@ jobs:
           image: ${{ needs.check.outputs.image_name }}:${{ needs.check.outputs.image_tag }}
           format: spdx-json
           output-file: ${{ runner.temp }}/source/SBOM.spdx.json
-          artifact-name: SBOM-${{ needs.check.outputs.image_tag }}.spdx.json
-          upload-artifact: true
+          upload-artifact: false
           upload-release-assets: false
+
+      - name: Add ddclient package to SPDX SBOM
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+        run: |
+          set -euo pipefail
+
+          SBOM="${RUNNER_TEMP}/source/SBOM.spdx.json"
+          VERSION="${DDCLIENT_VERSION#v}"
+          NEW_DDCLIENT_SPDX_ID="SPDXRef-Package-ddclient-${VERSION//[^A-Za-z0-9.-]/-}"
+
+          if [[ ! -s "${SBOM}" ]]; then
+            echo "ERROR: SBOM.spdx.json was not created or is empty."
+            exit 1
+          fi
+
+          ROOT_SPDX_ID=$(jq -r             --arg image "${IMAGE_NAME}"             --arg tag "${IMAGE_TAG}"             '[
+               .packages[] |
+               select(
+                 .name == $image and
+                 .versionInfo == $tag
+               ) |
+               .SPDXID
+             ][0] // empty'             "${SBOM}")
+
+          if [[ -z "${ROOT_SPDX_ID}" ]]; then
+            echo "ERROR: Could not identify the root container package in the SPDX SBOM."
+            exit 1
+          fi
+
+          if jq -e             --arg version "${VERSION}"             'any(
+               .packages[];
+               .name == "ddclient" and
+               .versionInfo == $version
+             )'             "${SBOM}" >/dev/null; then
+
+            echo "ddclient ${VERSION} is already present in the SBOM; enriching the existing package entry."
+
+            DDCLIENT_SPDX_ID=$(jq -r               --arg version "${VERSION}"               '[
+                 .packages[] |
+                 select(
+                   .name == "ddclient" and
+                   .versionInfo == $version
+                 ) |
+                 .SPDXID
+               ][0]'               "${SBOM}")
+
+            jq               --arg version "${VERSION}"               '
+              .packages |= map(
+                if .name == "ddclient" and .versionInfo == $version then
+                  . + {
+                    "downloadLocation": (
+                      "https://github.com/ddclient/ddclient/releases/tag/v" + $version
+                    ),
+                    "homepage": "https://github.com/ddclient/ddclient",
+                    "filesAnalyzed": false,
+                    "licenseConcluded": "GPL-2.0-or-later",
+                    "licenseDeclared": "GPL-2.0-or-later",
+                    "primaryPackagePurpose": "APPLICATION",
+                    "sourceInfo": (
+                      "Package metadata confirmed by the docker-ddclient build workflow " +
+                      "from the exact ddclient release selected for this image. The built " +
+                      "container was independently verified to report ddclient version " +
+                      $version + "."
+                    )
+                  }
+                else
+                  .
+                end
+              )
+              '               "${SBOM}" > "${SBOM}.tmp"
+
+            mv "${SBOM}.tmp" "${SBOM}"
+          else
+            echo "Adding explicitly verified ddclient ${VERSION} package metadata to the SBOM."
+
+            DDCLIENT_SPDX_ID="${NEW_DDCLIENT_SPDX_ID}"
+
+            jq               --arg id "${DDCLIENT_SPDX_ID}"               --arg version "${VERSION}"               '
+              .packages += [
+                {
+                  "SPDXID": $id,
+                  "name": "ddclient",
+                  "versionInfo": $version,
+                  "downloadLocation": (
+                    "https://github.com/ddclient/ddclient/releases/tag/v" + $version
+                  ),
+                  "homepage": "https://github.com/ddclient/ddclient",
+                  "filesAnalyzed": false,
+                  "licenseConcluded": "GPL-2.0-or-later",
+                  "licenseDeclared": "GPL-2.0-or-later",
+                  "copyrightText": "NOASSERTION",
+                  "primaryPackagePurpose": "APPLICATION",
+                  "externalRefs": [
+                    {
+                      "referenceCategory": "PACKAGE-MANAGER",
+                      "referenceType": "purl",
+                      "referenceLocator": (
+                        "pkg:github/ddclient/ddclient@" + $version
+                      )
+                    }
+                  ],
+                  "sourceInfo": (
+                    "Explicitly added by the docker-ddclient build workflow from " +
+                    "the exact ddclient release selected for this image. The built " +
+                    "container was independently verified to report ddclient version " +
+                    $version + "."
+                  )
+                }
+              ]
+              '               "${SBOM}" > "${SBOM}.tmp"
+
+            mv "${SBOM}.tmp" "${SBOM}"
+          fi
+
+          if ! jq -e             --arg root "${ROOT_SPDX_ID}"             --arg ddclient "${DDCLIENT_SPDX_ID}"             'any(
+               (.relationships // [])[];
+               .spdxElementId == $root and
+               .relationshipType == "CONTAINS" and
+               .relatedSpdxElement == $ddclient
+             )'             "${SBOM}" >/dev/null; then
+
+            jq               --arg root "${ROOT_SPDX_ID}"               --arg ddclient "${DDCLIENT_SPDX_ID}"               '
+              .relationships = (
+                (.relationships // []) +
+                [
+                  {
+                    "spdxElementId": $root,
+                    "relationshipType": "CONTAINS",
+                    "relatedSpdxElement": $ddclient,
+                    "comment": (
+                      "ddclient is the primary application installed in this container " +
+                      "and was explicitly version-verified by the build workflow."
+                    )
+                  }
+                ]
+              )
+              '               "${SBOM}" > "${SBOM}.tmp"
+
+            mv "${SBOM}.tmp" "${SBOM}"
+          fi
+
+          echo "ddclient SPDX package entry and container relationship are present."
+
+      - name: Upload final SPDX SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBOM-${{ needs.check.outputs.image_tag }}.spdx.json
+          path: ${{ runner.temp }}/source/SBOM.spdx.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Verify SBOM and create checksums
         shell: bash
         env:
           LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
         run: |
           set -euo pipefail
 
@@ -561,6 +719,62 @@ jobs:
             echo "ERROR: SBOM.spdx.json is not a valid SPDX JSON document."
             exit 1
           fi
+
+          EXPECTED_VERSION="${DDCLIENT_VERSION#v}"
+
+          if ! jq -e \
+            --arg version "${EXPECTED_VERSION}" \
+            '
+            [
+              .packages[] |
+              select(
+                .name == "ddclient" and
+                .versionInfo == $version and
+                .licenseDeclared == "GPL-2.0-or-later" and
+                .licenseConcluded == "GPL-2.0-or-later"
+              )
+            ] |
+            length == 1
+            ' \
+            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
+            echo "ERROR: Exactly one verified ddclient ${EXPECTED_VERSION} package entry is required in the final SPDX SBOM."
+            exit 1
+          fi
+
+          if ! jq -e \
+            --arg image "${IMAGE_NAME}" \
+            --arg tag "${IMAGE_TAG}" \
+            --arg version "${EXPECTED_VERSION}" \
+            '
+            ([.packages[] |
+               select(
+                 .name == $image and
+                 .versionInfo == $tag
+               )
+             ][0].SPDXID) as $root |
+
+            ([.packages[] |
+               select(
+                 .name == "ddclient" and
+                 .versionInfo == $version
+               )
+             ][0].SPDXID) as $ddclient |
+
+            ($root != null) and
+            ($ddclient != null) and
+            any(
+              (.relationships // [])[];
+              .spdxElementId == $root and
+              .relationshipType == "CONTAINS" and
+              .relatedSpdxElement == $ddclient
+            )
+            ' \
+            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
+            echo "ERROR: The final SPDX SBOM does not link the container package to ddclient."
+            exit 1
+          fi
+
+          echo "Verified ddclient ${EXPECTED_VERSION} package metadata in final SPDX SBOM."
 
           (
             cd "${SOURCE_DIR}"
@@ -635,7 +849,9 @@ jobs:
           from LinuxServer.io.
 
           \`SBOM.spdx.json\` is an SPDX JSON software bill of materials generated
-          from the final built container image.
+          from the final built container image. Because ddclient is installed outside
+          Alpine's package metadata, the workflow additionally records the exact
+          version-verified ddclient release as an explicit SPDX package.
 
           \`SHA256SUMS\` contains checksums for all attached source, license,
           copyright, wrapper, provenance, and SBOM files.
