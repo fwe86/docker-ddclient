@@ -24,7 +24,6 @@ jobs:
   check:
     name: Check upstream releases
     runs-on: ubuntu-latest
-
     outputs:
       build_required: ${{ steps.check_image.outputs.build_required }}
       ddclient_version: ${{ steps.versions.outputs.ddclient_version }}
@@ -183,12 +182,38 @@ jobs:
           echo "LSIO_COMMIT=${ACTUAL_COMMIT}" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
 
+      - name: Checkout project source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: project
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record project revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_COMMIT=$(git -C project rev-parse HEAD)
+
+          if [[ "${PROJECT_COMMIT}" != "${GITHUB_SHA}" ]]; then
+            echo "ERROR: Project checkout does not match workflow commit."
+            echo "Expected: ${GITHUB_SHA}"
+            echo "Actual  : ${PROJECT_COMMIT}"
+            exit 1
+          fi
+
+          echo "PROJECT_COMMIT=${PROJECT_COMMIT}" >> "$GITHUB_ENV"
+          echo "Project revision: ${PROJECT_COMMIT}"
+
       - name: Prepare corresponding source archives
         shell: bash
         env:
           LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
           IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
         run: |
           set -euo pipefail
 
@@ -260,11 +285,29 @@ jobs:
           cp "${DDCLIENT_SOURCE_ROOT}/COPYRIGHT" \
             "${SOURCE_DIR}/COPYRIGHT-ddclient"
 
+          echo "Copying project-owned final-image files..."
+
+          if [[ ! -f project/Dockerfile ]]; then
+            echo "ERROR: Project Dockerfile not found."
+            exit 1
+          fi
+
+          if [[ ! -f project/root/etc/s6-overlay/s6-rc.d/init-adduser/branding ]]; then
+            echo "ERROR: Project branding file not found."
+            exit 1
+          fi
+
+          cp project/Dockerfile \
+            "${SOURCE_DIR}/Dockerfile-final"
+
+          cp project/root/etc/s6-overlay/s6-rc.d/init-adduser/branding \
+            "${SOURCE_DIR}/branding"
+
           echo "Creating source information..."
 
           cat > "${SOURCE_DIR}/SOURCE_INFO.txt" <<EOF
           Image:
-          ${{ needs.check.outputs.image_name }}:${IMAGE_TAG}
+          ${IMAGE_NAME}:${IMAGE_TAG}
 
           Direct upstream sources used by this build:
 
@@ -284,40 +327,35 @@ jobs:
           License file: LICENSE-ddclient
           Copyright file: COPYRIGHT-ddclient
 
-          The source archives preserve the exact versions of the two direct
-          upstream projects selected by this build.
+          Final image wrapper
+          Repository: https://github.com/${GITHUB_REPOSITORY}
+          Commit: ${PROJECT_COMMIT}
+          License: GPL-3.0
+          Build file: Dockerfile-final
+          Branding file: branding
+
+          The LinuxServer.io source archive preserves the exact upstream release
+          selected by this build and is built unchanged as an intermediate image.
+
+          Dockerfile-final and branding are the project-owned final-image layer
+          used to distinguish the independently published image from the
+          LinuxServer.io upstream image. The wrapper does not modify the archived
+          LinuxServer.io source tree.
 
           The resulting container image additionally contains the LinuxServer.io
           base image, Alpine Linux packages, Perl modules and other third-party
           components. Those components remain subject to their respective
           copyright and license terms.
 
+          SBOM.spdx.json inventories components detected in the final built image.
+
           Publication of these source archives and license files does not
           relicense any upstream component.
           EOF
 
-          echo "Creating checksums..."
-
-          (
-            cd "${SOURCE_DIR}"
-
-            sha256sum \
-              "linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
-              "ddclient-${DDCLIENT_VERSION}.tar.gz" \
-              "LICENSE-linuxserver-docker-ddclient" \
-              "LICENSE-ddclient" \
-              "COPYRIGHT-ddclient" \
-              "SOURCE_INFO.txt" \
-              > SHA256SUMS
-          )
-
           echo
           echo "Prepared source and license files:"
           ls -lh "${SOURCE_DIR}"
-
-          echo
-          echo "Checksums:"
-          cat "${SOURCE_DIR}/SHA256SUMS"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -333,22 +371,140 @@ jobs:
           IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
           DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
           LSIO_BUILD: ${{ needs.check.outputs.lsio_build }}
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
         run: |
           set -euo pipefail
+
+          UPSTREAM_IMAGE="${IMAGE_NAME}:upstream-${IMAGE_TAG}"
+
+          echo "Building unchanged LinuxServer.io upstream source..."
 
           docker build \
             --pull \
             --build-arg DDCLIENT_VERSION="${DDCLIENT_VERSION}" \
             --build-arg VERSION="${IMAGE_TAG}" \
             --build-arg BUILD_DATE="${BUILD_DATE}" \
-            --label "org.opencontainers.image.version=${IMAGE_TAG}" \
-            --label "org.opencontainers.image.revision=${LSIO_COMMIT}" \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            -t "${UPSTREAM_IMAGE}" \
+            .
+
+          echo "Building independently branded final image..."
+
+          docker build \
+            --build-arg UPSTREAM_IMAGE="${UPSTREAM_IMAGE}" \
+            --build-arg IMAGE_VERSION="${IMAGE_TAG}" \
+            --build-arg BUILD_DATE="${BUILD_DATE}" \
+            --build-arg DDCLIENT_VERSION="${DDCLIENT_VERSION}" \
+            --build-arg LSIO_TAG="${LSIO_TAG}" \
+            --build-arg LSIO_COMMIT="${LSIO_COMMIT}" \
+            --build-arg PROJECT_COMMIT="${PROJECT_COMMIT}" \
+            -f project/Dockerfile \
             -t "${IMAGE_NAME}:latest" \
             -t "${IMAGE_NAME}:${DDCLIENT_VERSION}" \
             -t "${IMAGE_NAME}:ls${LSIO_BUILD}" \
             -t "${IMAGE_NAME}:${IMAGE_TAG}" \
-            .
+            project
+
+      - name: Verify image identity and branding
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.check.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.check.outputs.image_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+          get_label() {
+            docker image inspect \
+              --format "{{ index .Config.Labels \"$1\" }}" \
+              "${IMAGE}"
+          }
+
+          assert_label() {
+            local key="$1"
+            local expected="$2"
+            local actual
+
+            actual="$(get_label "${key}")"
+
+            if [[ "${actual}" != "${expected}" ]]; then
+              echo "ERROR: Unexpected image label ${key}"
+              echo "Expected: ${expected}"
+              echo "Actual  : ${actual}"
+              exit 1
+            fi
+          }
+
+          assert_label "maintainer" "fwe86"
+          assert_label "org.opencontainers.image.authors" "fwe86"
+          assert_label "org.opencontainers.image.vendor" "fwe86"
+          assert_label "org.opencontainers.image.title" "docker-ddclient"
+          assert_label "org.opencontainers.image.source" \
+            "https://github.com/${GITHUB_REPOSITORY}"
+          assert_label "org.opencontainers.image.version" "${IMAGE_TAG}"
+          assert_label "org.opencontainers.image.revision" "${PROJECT_COMMIT}"
+          assert_label "io.github.fwe86.ddclient.version" "${DDCLIENT_VERSION}"
+          assert_label "io.github.fwe86.linuxserver.release" "${LSIO_TAG}"
+          assert_label "io.github.fwe86.linuxserver.revision" "${LSIO_COMMIT}"
+
+          BUILD_LABEL="$(get_label build_version)"
+
+          if grep -Fqi "Linuxserver.io version" <<< "${BUILD_LABEL}"; then
+            echo "ERROR: LinuxServer.io build branding is still present in build_version."
+            exit 1
+          fi
+
+          if ! grep -Fq "fwe86/docker-ddclient version:" <<< "${BUILD_LABEL}"; then
+            echo "ERROR: Project build_version label is missing."
+            exit 1
+          fi
+
+          if ! docker image inspect \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            "${IMAGE}" | grep -Fxq 'LSIO_FIRST_PARTY=false'; then
+            echo "ERROR: LSIO_FIRST_PARTY=false is not set."
+            exit 1
+          fi
+
+          BUILD_VERSION_CONTENT=$(docker run --rm \
+            --entrypoint cat \
+            "${IMAGE}" \
+            /build_version)
+
+          echo "${BUILD_VERSION_CONTENT}"
+
+          if grep -Fqi "Linuxserver.io version:" <<< "${BUILD_VERSION_CONTENT}"; then
+            echo "ERROR: LinuxServer.io /build_version branding is still present."
+            exit 1
+          fi
+
+          if ! grep -Fq "fwe86/docker-ddclient version: ${IMAGE_TAG}" \
+            <<< "${BUILD_VERSION_CONTENT}"; then
+            echo "ERROR: Project /build_version identification is missing."
+            exit 1
+          fi
+
+          if ! grep -Fq "LinuxServer.io docker-ddclient source: ${LSIO_TAG}" \
+            <<< "${BUILD_VERSION_CONTENT}"; then
+            echo "ERROR: Upstream provenance is missing from /build_version."
+            exit 1
+          fi
+
+          BRANDING_CONTENT=$(docker run --rm \
+            --entrypoint cat \
+            "${IMAGE}" \
+            /etc/s6-overlay/s6-rc.d/init-adduser/branding)
+
+          echo "${BRANDING_CONTENT}"
+
+          if ! grep -Fq "fwe86/docker-ddclient" <<< "${BRANDING_CONTENT}"; then
+            echo "ERROR: Custom container branding is missing."
+            exit 1
+          fi
+
+          echo "Image identity and branding verified successfully."
 
       - name: Verify ddclient version
         shell: bash
@@ -374,6 +530,60 @@ jobs:
           fi
 
           echo "Verified ddclient ${EXPECTED_VERSION} successfully."
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.check.outputs.image_name }}:${{ needs.check.outputs.image_tag }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/source/SBOM.spdx.json
+          artifact-name: SBOM-${{ needs.check.outputs.image_tag }}.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Verify SBOM and create checksums
+        shell: bash
+        env:
+          LSIO_TAG: ${{ needs.check.outputs.lsio_tag }}
+          DDCLIENT_VERSION: ${{ needs.check.outputs.ddclient_version }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR="${RUNNER_TEMP}/source"
+
+          if [[ ! -s "${SOURCE_DIR}/SBOM.spdx.json" ]]; then
+            echo "ERROR: SBOM.spdx.json was not created or is empty."
+            exit 1
+          fi
+
+          if ! jq -e '.spdxVersion and .packages' \
+            "${SOURCE_DIR}/SBOM.spdx.json" >/dev/null; then
+            echo "ERROR: SBOM.spdx.json is not a valid SPDX JSON document."
+            exit 1
+          fi
+
+          (
+            cd "${SOURCE_DIR}"
+
+            sha256sum \
+              "linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
+              "ddclient-${DDCLIENT_VERSION}.tar.gz" \
+              "LICENSE-linuxserver-docker-ddclient" \
+              "LICENSE-ddclient" \
+              "COPYRIGHT-ddclient" \
+              "Dockerfile-final" \
+              "branding" \
+              "SOURCE_INFO.txt" \
+              "SBOM.spdx.json" \
+              > SHA256SUMS
+          )
+
+          echo
+          echo "Final release assets:"
+          ls -lh "${SOURCE_DIR}"
+          echo
+          echo "Checksums:"
+          cat "${SOURCE_DIR}/SHA256SUMS"
 
       - name: Push images
         shell: bash
@@ -401,6 +611,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          SOURCE_DIR="${RUNNER_TEMP}/source"
           RELEASE_TAG="image-${IMAGE_TAG}"
           RELEASE_TITLE="${IMAGE_TAG}"
 
@@ -414,48 +625,65 @@ jobs:
           - ddclient: \`${DDCLIENT_VERSION}\`
           - LinuxServer.io docker-ddclient: \`${LSIO_TAG}\`
 
-          ## Source
+          ## Source and compliance material
 
-          The attached source archives contain the exact ddclient and
-          LinuxServer.io docker-ddclient source versions selected by this build.
+          The attached archives contain the exact ddclient and LinuxServer.io
+          docker-ddclient source versions selected by this build.
 
-          \`SHA256SUMS\` contains checksums for both archives.
+          \`Dockerfile-final\` and \`branding\` are the exact project-owned
+          final-image files used to distinguish this independently published image
+          from LinuxServer.io.
+
+          \`SBOM.spdx.json\` is an SPDX JSON software bill of materials generated
+          from the final built container image.
+
+          \`SHA256SUMS\` contains checksums for all attached source, license,
+          copyright, wrapper, provenance, and SBOM files.
 
           The Docker image also contains third-party packages from the
           LinuxServer.io Alpine base image and Alpine repositories. Those
           components remain subject to their respective licenses.
+
+          This is an independent project and is not affiliated with, endorsed by,
+          or maintained by LinuxServer.io or the ddclient project.
           EOF
+
+          ASSETS=(
+            "${SOURCE_DIR}/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz"
+            "${SOURCE_DIR}/ddclient-${DDCLIENT_VERSION}.tar.gz"
+            "${SOURCE_DIR}/LICENSE-linuxserver-docker-ddclient"
+            "${SOURCE_DIR}/LICENSE-ddclient"
+            "${SOURCE_DIR}/COPYRIGHT-ddclient"
+            "${SOURCE_DIR}/Dockerfile-final"
+            "${SOURCE_DIR}/branding"
+            "${SOURCE_DIR}/SOURCE_INFO.txt"
+            "${SOURCE_DIR}/SBOM.spdx.json"
+            "${SOURCE_DIR}/SHA256SUMS"
+          )
 
           if gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
 
             echo "Release ${RELEASE_TAG} already exists."
 
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file "${RUNNER_TEMP}/release-notes.md"
+
             gh release upload "${RELEASE_TAG}" \
-              "${RUNNER_TEMP}/source/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
-              "${RUNNER_TEMP}/source/ddclient-${DDCLIENT_VERSION}.tar.gz" \
-              "${RUNNER_TEMP}/source/LICENSE-linuxserver-docker-ddclient" \
-              "${RUNNER_TEMP}/source/LICENSE-ddclient" \
-              "${RUNNER_TEMP}/source/COPYRIGHT-ddclient" \
-              "${RUNNER_TEMP}/source/SOURCE_INFO.txt" \
-              "${RUNNER_TEMP}/source/SHA256SUMS" \
+              "${ASSETS[@]}" \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber
           else
             gh release create "${RELEASE_TAG}" \
-              "${RUNNER_TEMP}/source/linuxserver-docker-ddclient-${LSIO_TAG}.tar.gz" \
-              "${RUNNER_TEMP}/source/ddclient-${DDCLIENT_VERSION}.tar.gz" \
-              "${RUNNER_TEMP}/source/LICENSE-linuxserver-docker-ddclient" \
-              "${RUNNER_TEMP}/source/LICENSE-ddclient" \
-              "${RUNNER_TEMP}/source/COPYRIGHT-ddclient" \
-              "${RUNNER_TEMP}/source/SOURCE_INFO.txt" \
-              "${RUNNER_TEMP}/source/SHA256SUMS" \
+              "${ASSETS[@]}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "${RELEASE_TITLE}" \
               --notes-file "${RUNNER_TEMP}/release-notes.md"
           fi
 
-      - name: Checkout own repository
+      - name: Checkout own repository for state update
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
