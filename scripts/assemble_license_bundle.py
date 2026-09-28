@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble convenient third-party license/notice material for a release.
 
-The complete corresponding-source archives remain authoritative.  This script
+The complete corresponding-source archives remain authoritative. This script
 creates an additional, easy-to-consume bundle from license/copyright/notice
 files already present in direct source material and generated source bundles.
 It intentionally does not infer or relicense any component.
@@ -21,10 +21,6 @@ LICENSE_NAME = re.compile(
     re.IGNORECASE,
 )
 MAX_FILE_BYTES = 4 * 1024 * 1024
-
-
-def safe(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.+-]+", "_", value)
 
 
 def sha256(path: Path) -> str:
@@ -60,17 +56,34 @@ def main() -> int:
     def store(origin_asset: str, origin_member: str, data: bytes) -> None:
         if not data or len(data) > MAX_FILE_BYTES:
             return
+
         digest = hashlib.sha256(data).hexdigest()
+
         if digest in seen_digest:
-            rows.append([origin_asset, origin_member, seen_digest[digest], digest, "duplicate"])
+            rows.append(
+                [origin_asset, origin_member, seen_digest[digest], digest, "duplicate"]
+            )
             return
-        filename = f"{safe(origin_asset)}__{safe(origin_member)}"
+
+        # Use a content-addressed filename instead of concatenating archive/member
+        # paths. Alpine source archives can contain members whose full paths are
+        # far beyond Linux NAME_MAX (commonly 255 bytes) once flattened.
+        filename = f"sha256-{digest}"
         target = files_dir / filename
-        counter = 1
-        while target.exists():
-            target = files_dir / f"{safe(origin_asset)}__{counter}__{safe(origin_member)}"
-            counter += 1
-        target.write_bytes(data)
+
+        # A full SHA-256 name is deterministic and unique for the content. If a
+        # path somehow already exists, verify that it is the same content rather
+        # than silently overwriting anything.
+        if target.exists():
+            existing_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if existing_digest != digest:
+                raise SystemExit(
+                    f"SHA-256 filename collision for {target}: "
+                    f"expected {digest}, found {existing_digest}"
+                )
+        else:
+            target.write_bytes(data)
+
         rel = target.relative_to(bundle).as_posix()
         seen_digest[digest] = rel
         rows.append([origin_asset, origin_member, rel, digest, "stored"])
@@ -90,8 +103,8 @@ def main() -> int:
                 store(path.name, path.name, path.read_bytes())
 
     # Generated compliance archives expose dedicated license-material/ or
-    # licenses/ directories.  Embedded-script archives also contain a GPL
-    # license.  Read those members without extracting arbitrary archive paths.
+    # licenses/ directories. Embedded-script archives also contain a GPL
+    # license. Read those members without extracting arbitrary archive paths.
     archive_candidates = [
         p
         for p in sorted(source_dir.glob("*.tar.gz"))
@@ -102,6 +115,7 @@ def main() -> int:
             or p.name.endswith("linuxserver-base-embedded-scripts.tar.gz")
         )
     ]
+
     for archive in archive_candidates:
         try:
             with tarfile.open(archive, "r:gz") as tf:
@@ -112,7 +126,9 @@ def main() -> int:
                     basename = Path(member.name).name
                     dedicated = "license-material" in parts or "licenses" in parts
                     embedded_license = (
-                        archive.name.endswith("linuxserver-base-embedded-scripts.tar.gz")
+                        archive.name.endswith(
+                            "linuxserver-base-embedded-scripts.tar.gz"
+                        )
                         and LICENSE_NAME.match(basename)
                     )
                     if not dedicated and not embedded_license:
@@ -124,7 +140,9 @@ def main() -> int:
                     if len(data) <= MAX_FILE_BYTES:
                         store(archive.name, member.name, data)
         except tarfile.TarError as exc:
-            raise SystemExit(f"Could not read compliance archive {archive}: {exc}") from exc
+            raise SystemExit(
+                f"Could not read compliance archive {archive}: {exc}"
+            ) from exc
 
     if not rows:
         raise SystemExit("No license/copyright/notice material was collected")
@@ -132,7 +150,9 @@ def main() -> int:
     manifest = bundle / "THIRD_PARTY_LICENSES.tsv"
     with manifest.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
-        writer.writerow(["origin_asset", "origin_member", "bundled_file", "sha256", "status"])
+        writer.writerow(
+            ["origin_asset", "origin_member", "bundled_file", "sha256", "status"]
+        )
         writer.writerows(rows)
 
     (bundle / "README.txt").write_text(
@@ -142,6 +162,9 @@ def main() -> int:
         "the container image. It is provided for convenient access to license,\n"
         "copyright, and notice files. It does not change any component's license\n"
         "and is not a substitute for the complete corresponding-source archives.\n\n"
+        "Files below files/ are content-addressed by their SHA-256 digest. The\n"
+        "THIRD_PARTY_LICENSES.tsv manifest maps every original asset/member path\n"
+        "to the corresponding bundled file and records duplicates explicitly.\n\n"
         f"Complete compliance release: {args.release_url}\n",
         encoding="utf-8",
     )
@@ -150,11 +173,14 @@ def main() -> int:
     with checksums.open("w", encoding="utf-8") as fh:
         for path in sorted(bundle.rglob("*")):
             if path.is_file() and path != checksums:
-                fh.write(f"{sha256(path)}  {path.relative_to(bundle).as_posix()}\n")
+                fh.write(
+                    f"{sha256(path)}  {path.relative_to(bundle).as_posix()}\n"
+                )
 
     archive = output / "third-party-licenses.tar.gz"
     with tarfile.open(archive, "w:gz") as tf:
         tf.add(bundle, arcname="third-party-licenses")
+
     shutil.copy2(manifest, output / "THIRD_PARTY_LICENSES.tsv")
     print(archive)
     return 0
