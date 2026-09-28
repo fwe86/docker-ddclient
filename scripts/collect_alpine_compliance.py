@@ -272,15 +272,36 @@ set -eu
 apk add --no-cache abuild ca-certificates curl git wget >/dev/null
 adduser -D -h /home/builder builder 2>/dev/null || true
 addgroup builder abuild 2>/dev/null || true
+mkdir -p /compliance/fetch-overrides
+printf 'source_unit\treason\n' > /compliance/FETCH_OVERRIDES.tsv
 while IFS="$(printf '\t')" read -r unit rel; do
   [ -n "$unit" ] || continue
   rm -rf /work
   mkdir -p /work "/compliance/distfiles/$unit"
   cp -a "/compliance/$rel/." /work/
   chown -R builder:abuild /work "/compliance/distfiles/$unit"
-  su builder -c "cd /work && export SRCDEST='/compliance/distfiles/$unit' && abuild fetch"
+
+  cp /work/APKBUILD /work/APKBUILD.original
+  sed -E -i \
+    's#https://gitlab\.alpinelinux\.org/alpine/([^/[:space:]"]+)/-/archive/([^/[:space:]"]+)/[^[:space:]"]+#https://github.com/alpinelinux/\1/archive/\2.tar.gz#g' \
+    /work/APKBUILD
+
+  if ! cmp -s /work/APKBUILD.original /work/APKBUILD; then
+    mkdir -p "/compliance/fetch-overrides/$unit"
+    cp /work/APKBUILD.original "/compliance/fetch-overrides/$unit/APKBUILD.original"
+
+    chown -R builder:abuild /work "/compliance/distfiles/$unit"
+    su builder -c "cd /work && export SRCDEST='/compliance/distfiles/$unit' && abuild checksum && abuild fetch"
+
+    cp /work/APKBUILD "/compliance/fetch-overrides/$unit/APKBUILD.mirror-fetch"
+    printf '%s\t%s\n' "$unit" \
+      'Alpine GitLab archive URL rewritten to official alpinelinux GitHub mirror for fetching; temporary fetch-copy checksums recomputed' \
+      >> /compliance/FETCH_OVERRIDES.tsv
+  else
+    su builder -c "cd /work && export SRCDEST='/compliance/distfiles/$unit' && abuild fetch"
+  fi
 done < /compliance/FETCH_PLAN.tsv
-chmod -R a+rX /compliance/distfiles
+chmod -R a+rX /compliance/distfiles /compliance/fetch-overrides /compliance/FETCH_OVERRIDES.tsv
 '''
     run(
         [
