@@ -28,6 +28,7 @@ LABEL maintainer="fwe86" \
       org.opencontainers.image.documentation="https://github.com/fwe86/docker-ddclient#readme" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.revision="${PROJECT_COMMIT}" \
+      org.opencontainers.image.licenses="NOASSERTION" \
       io.github.fwe86.ddclient.version="${DDCLIENT_VERSION}" \
       io.github.fwe86.linuxserver.release="${LSIO_TAG}" \
       io.github.fwe86.linuxserver.revision="${LSIO_COMMIT}" \

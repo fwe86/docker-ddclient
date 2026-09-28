@@ -181,11 +181,57 @@ build as expected.
 
 ## Verification material
 
-Each release contains `SHA256SUMS` covering the release assets available before
-image publication. After the exact GHCR tag is pushed, `IMAGE_DIGESTS.txt` is
-attached to the same release and records the immutable registry digest.
+Each new-image compliance release contains `SHA256SUMS` covering every release
+asset prepared before image publication. The workflow immediately runs
+`sha256sum -c SHA256SUMS` locally and, after upload, compares the SHA-256 digest
+reported by GitHub for **every uploaded asset** with the local digest. A count
+match alone is not accepted.
 
-The project does not set a single `org.opencontainers.image.licenses` value for
-the complete image, because the image is an aggregate of components distributed
-under multiple licenses. Component-level license information belongs in the
-source material and SBOM.
+Legacy backfills use the same model with
+`legacy-<digest>-BACKFILL_SHA256SUMS`. The checksum file is verified locally
+immediately after creation. On retries, existing release assets are never
+silently trusted by filename: the workflow compares GitHub's immutable
+server-side SHA-256 digest with the newly generated local file. A mismatching
+existing asset causes the workflow to fail rather than overwrite history.
+
+If a legacy digest has already been backfilled, the workflow verifies the
+existing remote release against its published `BACKFILL_SHA256SUMS` before it
+skips regeneration.
+
+After an exact GHCR tag is pushed, `IMAGE_DIGESTS.txt` is attached to the
+already-published immutable compliance release and its GitHub asset digest is
+verified as well.
+
+## OCI license metadata
+
+The inherited LinuxServer.io image carries an
+`org.opencontainers.image.licenses` value that describes the upstream project,
+but the final container is an aggregate of independently licensed components.
+Docker inherits parent labels and does not provide a native Dockerfile operation
+to delete one inherited label.
+
+The final wrapper therefore overrides:
+
+```text
+org.opencontainers.image.licenses=NOASSERTION
+```
+
+`NOASSERTION` is an SPDX license-expression special identifier. It deliberately
+avoids making an incorrect blanket license assertion for the aggregate image.
+Actual component licenses remain documented in the SBOM, corresponding-source
+archives, license/notice bundle, and individual upstream license files.
+
+
+For legacy images that were already published with an inherited blanket OCI
+license value, the backfill records the value observed in the immutable image
+and publishes a digest-specific `OCI_LICENSE_METADATA_NOTICE.txt`. The legacy
+image digest is not rewritten or retagged merely to alter metadata; the notice
+clarifies the aggregate nature of the image and points to the authoritative
+component-level license material.
+
+For a legacy digest whose original backfill had already completed before this
+metadata hardening was introduced, the workflow preserves the historical
+`BACKFILL_SHA256SUMS` unchanged. It first verifies that original manifest against
+GitHub's server-side asset digests, then appends the deterministic OCI metadata
+notice plus a dedicated `.sha256` sidecar and verifies both new assets against the
+server-side digests. This keeps the historical bundle append-only.

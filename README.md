@@ -67,7 +67,7 @@ For a new version combination it then:
    collects their exact source releases;
 10. generates and verifies an SPDX JSON SBOM;
 11. creates SHA-256 checksums and an immutable GitHub compliance release;
-12. verifies that source/compliance release **before** logging into GHCR;
+12. verifies that source/compliance release and every GitHub server-side SHA-256 asset digest **before** logging into GHCR;
 13. publishes mutable convenience tags and finally the immutable exact tag;
 14. attaches the registry digest to the already published compliance release;
 15. updates `.upstream` only after successful publication.
@@ -145,12 +145,19 @@ io.github.fwe86.linuxserver.revision=<LinuxServer.io commit>
 io.github.fwe86.linuxserver.base.digest=<base image digest>
 io.github.fwe86.compliance.release=<GitHub compliance release>
 io.github.fwe86.compliance.url=<GitHub compliance release URL>
+org.opencontainers.image.licenses=NOASSERTION
 ```
 
-The project intentionally does **not** assign one blanket OCI license expression
-to the complete image. The image contains components under multiple licenses;
-component-level license information is represented by the source material and
-SBOM.
+The LinuxServer.io parent image currently carries a blanket OCI license label.
+Dockerfile labels are inherited and Docker does not provide a native `unset`
+operation for a label inherited from a parent image. This project therefore
+**overrides** `org.opencontainers.image.licenses` with the SPDX special
+identifier `NOASSERTION`.
+
+That value intentionally makes no blanket license assertion for the complete
+multi-license image. Component-level license information remains authoritative
+in the SBOM, corresponding-source archives, license/notice bundle, and the
+individual upstream license files in the compliance release.
 
 ## Compliance release contents
 

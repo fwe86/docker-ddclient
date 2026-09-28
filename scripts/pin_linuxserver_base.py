@@ -63,10 +63,11 @@ def main() -> int:
     repo = repository_without_tag(base_ref)
 
     digest_ref = next((d for d in repo_digests if d.startswith(repo + "@")), None)
-    if digest_ref is None and repo_digests:
-        digest_ref = repo_digests[0]
     if digest_ref is None:
-        raise SystemExit(f"Docker did not report a RepoDigest for {base_ref}")
+        raise SystemExit(
+            f"Docker did not report a RepoDigest matching the requested base repository {repo} for {base_ref}; "
+            f"reported values: {repo_digests!r}"
+        )
 
     digest = digest_ref.split("@", 1)[1]
     pinned_ref = f"{repo}@{digest}"

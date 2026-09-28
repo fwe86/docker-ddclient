@@ -337,6 +337,7 @@ jobs:
           assert_label org.opencontainers.image.source "https://github.com/${GITHUB_REPOSITORY}"
           assert_label org.opencontainers.image.version "$IMAGE_TAG"
           assert_label org.opencontainers.image.revision "$PROJECT_COMMIT"
+          assert_label org.opencontainers.image.licenses "NOASSERTION"
           assert_label io.github.fwe86.ddclient.version "$DDCLIENT_VERSION"
           assert_label io.github.fwe86.linuxserver.release "$LSIO_TAG"
           assert_label io.github.fwe86.linuxserver.revision "$LSIO_COMMIT"
@@ -556,6 +557,8 @@ jobs:
           - CPAN distributions are discovered from installed .packlist files and their exact installed versions are archived from MetaCPAN.
           - LinuxServer.io base source, s6-overlay source, exact embedded helper scripts, the project wrapper, ddclient source, a consolidated third-party license/notice convenience bundle, and an SPDX SBOM are included.
           - This source release is published and verified before the container image is pushed.
+          - Every uploaded compliance asset is verified against GitHub's server-side SHA-256 digest.
+          - org.opencontainers.image.licenses is deliberately overridden to SPDX NOASSERTION for the aggregate multi-license image.
           - Exact image tags are immutable; the workflow has no force-rebuild path.
           EOF
           sed -i 's/^          //' "${SOURCE_DIR}/SOURCE_INFO.txt"
@@ -649,18 +652,55 @@ jobs:
             "${ASSETS[@]}"
 
           EXPECTED=${#ASSETS[@]}
-          ACTUAL=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${GITHUB_REPOSITORY}/releases/tags/${COMPLIANCE_RELEASE}" \
-            --jq '.assets | length')
-          if [[ "$ACTUAL" -ne "$EXPECTED" ]]; then
-            echo "ERROR: Compliance release contains ${ACTUAL} assets, expected ${EXPECTED}." >&2
+          RELEASE_JSON=""
+          for attempt in 1 2 3 4 5; do
+            RELEASE_JSON=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/${COMPLIANCE_RELEASE}")
+            ACTUAL=$(jq '.assets | length' <<< "$RELEASE_JSON")
+            MISSING_DIGESTS=$(jq '[.assets[] | select((.digest // "") == "")] | length' <<< "$RELEASE_JSON")
+            if [[ "$ACTUAL" -eq "$EXPECTED" && "$MISSING_DIGESTS" -eq 0 ]]; then
+              break
+            fi
+            echo "Waiting for complete GitHub release-asset metadata (${ACTUAL}/${EXPECTED}, missing digests: ${MISSING_DIGESTS})..." >&2
+            sleep $((attempt * 2))
+          done
+
+          ACTUAL=$(jq '.assets | length' <<< "$RELEASE_JSON")
+          MISSING_DIGESTS=$(jq '[.assets[] | select((.digest // "") == "")] | length' <<< "$RELEASE_JSON")
+          if [[ "$ACTUAL" -ne "$EXPECTED" || "$MISSING_DIGESTS" -ne 0 ]]; then
+            echo "ERROR: Compliance release metadata is incomplete after retries: assets=${ACTUAL}/${EXPECTED}, missing_digests=${MISSING_DIGESTS}." >&2
             exit 1
           fi
 
-          RELEASE_URL=$(gh release view "$COMPLIANCE_RELEASE" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')
+          for file in "${ASSETS[@]}"; do
+            name=$(basename "$file")
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            remote_count=$(jq --arg name "$name" '[.assets[] | select(.name == $name)] | length' <<< "$RELEASE_JSON")
+            [[ "$remote_count" -eq 1 ]] || {
+              echo "ERROR: Expected exactly one GitHub release asset named ${name}, found ${remote_count}." >&2
+              exit 1
+            }
+            remote_digest=$(jq -r --arg name "$name" '
+              [.assets[] | select(.name == $name) | .digest][0] // empty
+            ' <<< "$RELEASE_JSON")
+
+            [[ -n "$remote_digest" ]] || {
+              echo "ERROR: GitHub did not report a digest for release asset ${name}." >&2
+              exit 1
+            }
+            if [[ "$remote_digest" != "$local_digest" ]]; then
+              echo "ERROR: Release asset digest mismatch for ${name}." >&2
+              echo "Local : ${local_digest}" >&2
+              echo "GitHub: ${remote_digest}" >&2
+              exit 1
+            fi
+          done
+
+          RELEASE_URL=$(jq -r '.html_url // empty' <<< "$RELEASE_JSON")
           [[ -n "$RELEASE_URL" ]] || { echo "ERROR: Compliance release is not retrievable." >&2; exit 1; }
-          echo "Verified source release: ${RELEASE_URL}"
+          echo "Verified source release and all ${EXPECTED} asset digests: ${RELEASE_URL}"
 
       - name: Login to GHCR only after source disclosure
         uses: docker/login-action@v4.6.0
@@ -723,17 +763,42 @@ jobs:
           EOF
           sed -i 's/^          //' "${RUNNER_TEMP}/IMAGE_DIGESTS.txt"
 
+          uploaded=false
           for attempt in 1 2 3; do
             if gh release upload "$COMPLIANCE_RELEASE" \
               "${RUNNER_TEMP}/IMAGE_DIGESTS.txt" \
               --repo "$GITHUB_REPOSITORY"; then
-              exit 0
+              uploaded=true
+              break
             fi
             echo "Digest-asset upload attempt ${attempt} failed." >&2
             sleep $((attempt * 5))
           done
-          echo "ERROR: The image is published and source was already disclosed, but IMAGE_DIGESTS.txt could not be attached." >&2
-          exit 1
+          if [[ "$uploaded" != "true" ]]; then
+            echo "ERROR: The image is published and source was already disclosed, but IMAGE_DIGESTS.txt could not be attached." >&2
+            exit 1
+          fi
+
+          local_digest="sha256:$(sha256sum "${RUNNER_TEMP}/IMAGE_DIGESTS.txt" | awk '{print $1}')"
+          remote_digest=""
+          for attempt in 1 2 3 4 5; do
+            remote_digest=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/${COMPLIANCE_RELEASE}" \
+              --jq '.assets[] | select(.name == "IMAGE_DIGESTS.txt") | .digest' \
+              2>/dev/null | head -n1 || true)
+            [[ -n "$remote_digest" ]] && break
+            sleep $((attempt * 2))
+          done
+
+          if [[ "$remote_digest" != "$local_digest" ]]; then
+            echo "ERROR: IMAGE_DIGESTS.txt GitHub asset digest mismatch." >&2
+            echo "Local : ${local_digest}" >&2
+            echo "GitHub: ${remote_digest:-<missing>}" >&2
+            exit 1
+          fi
+          echo "Verified IMAGE_DIGESTS.txt server-side digest: ${remote_digest}"
 
       - name: Update tracked upstream state after successful publication
         shell: bash

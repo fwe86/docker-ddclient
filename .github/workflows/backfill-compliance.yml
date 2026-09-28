@@ -15,6 +15,7 @@ on:
       - "scripts/collect_alpine_compliance.py"
       - "scripts/collect_cpan_compliance.py"
       - "scripts/collect_s6_component_sources.py"
+      - "scripts/assemble_license_bundle.py"
       - "COMPLIANCE.md"
 
 permissions:
@@ -131,6 +132,10 @@ jobs:
           LSIO_TAG=$(get_label io.github.fwe86.linuxserver.release)
           LSIO_COMMIT=$(get_label io.github.fwe86.linuxserver.revision)
           PROJECT_COMMIT=$(get_label org.opencontainers.image.revision)
+          LEGACY_OCI_LICENSES=$(get_label org.opencontainers.image.licenses)
+          if [[ -z "$LEGACY_OCI_LICENSES" || "$LEGACY_OCI_LICENSES" == '<no value>' ]]; then
+            LEGACY_OCI_LICENSES="<absent>"
+          fi
 
           [[ -n "$DDCLIENT_VERSION" && "$DDCLIENT_VERSION" != '<no value>' ]] || {
             echo "ERROR: Legacy image does not expose its ddclient version label." >&2
@@ -172,6 +177,7 @@ jobs:
             echo "LSIO_TAG=${LSIO_TAG}"
             echo "LSIO_COMMIT=${LSIO_COMMIT}"
             echo "PROJECT_COMMIT=${PROJECT_COMMIT}"
+            echo "LEGACY_OCI_LICENSES=${LEGACY_OCI_LICENSES}"
             echo "RELEASE_TAG=${RELEASE_TAG}"
             echo "RELEASE_CREATED=${RELEASE_CREATED}"
             echo "WORK_DIR=${WORK_DIR}"
@@ -181,7 +187,7 @@ jobs:
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "release_created=${RELEASE_CREATED}" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if this exact digest has already been backfilled
+      - name: Determine whether this exact digest is already backfilled
         id: marker
         shell: bash
         env:
@@ -191,11 +197,180 @@ jobs:
           MARKER="legacy-${DIGEST_SHORT}-BACKFILL_SOURCE_INFO.txt"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$MARKER"; then
-            echo "This exact image digest has already been backfilled."
+            echo "This exact image digest already has a backfill marker; remote integrity will be verified before skipping regeneration."
             echo "required=false" >> "$GITHUB_OUTPUT"
           else
             echo "required=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Verify integrity of an existing backfill before skipping
+        if: steps.marker.outputs.required == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PREFIX="legacy-${DIGEST_SHORT}"
+          CHECKSUM_NAME="${PREFIX}-BACKFILL_SHA256SUMS"
+          VERIFY_DIR="${RUNNER_TEMP}/existing-backfill-verification"
+          mkdir -p "$VERIFY_DIR"
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$CHECKSUM_NAME" \
+            --dir "$VERIFY_DIR"
+
+          CHECKSUM_FILE="${VERIFY_DIR}/${CHECKSUM_NAME}"
+          [[ -s "$CHECKSUM_FILE" ]] || {
+            echo "ERROR: Existing backfill marker is present, but ${CHECKSUM_NAME} is missing." >&2
+            exit 1
+          }
+
+          RELEASE_JSON=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+
+          while read -r expected_hash asset_name; do
+            [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "ERROR: Invalid checksum entry in ${CHECKSUM_NAME}: ${expected_hash} ${asset_name}" >&2
+              exit 1
+            }
+            [[ -n "$asset_name" ]] || {
+              echo "ERROR: Empty asset name in ${CHECKSUM_NAME}." >&2
+              exit 1
+            }
+
+            remote_digest=$(jq -r --arg name "$asset_name" '
+              [.assets[] | select(.name == $name) | .digest][0] // empty
+            ' <<< "$RELEASE_JSON")
+            expected_digest="sha256:${expected_hash}"
+
+            if [[ -z "$remote_digest" ]]; then
+              echo "ERROR: Existing backfill is incomplete; asset ${asset_name} is missing or has no GitHub digest." >&2
+              exit 1
+            fi
+            if [[ "$remote_digest" != "$expected_digest" ]]; then
+              echo "ERROR: Existing backfill asset digest mismatch for ${asset_name}." >&2
+              echo "Manifest: ${expected_digest}" >&2
+              echo "GitHub  : ${remote_digest}" >&2
+              exit 1
+            fi
+          done < "$CHECKSUM_FILE"
+
+          checksum_local="sha256:$(sha256sum "$CHECKSUM_FILE" | awk '{print $1}')"
+          checksum_remote=$(jq -r --arg name "$CHECKSUM_NAME" '
+            [.assets[] | select(.name == $name) | .digest][0] // empty
+          ' <<< "$RELEASE_JSON")
+          if [[ "$checksum_remote" != "$checksum_local" ]]; then
+            echo "ERROR: Existing ${CHECKSUM_NAME} server-side digest mismatch." >&2
+            echo "Local : ${checksum_local}" >&2
+            echo "GitHub: ${checksum_remote:-<missing>}" >&2
+            exit 1
+          fi
+
+          echo "Existing backfill release is complete and all published asset digests match ${CHECKSUM_NAME}."
+
+      - name: Add and verify legacy OCI license metadata notice for an already completed backfill
+        if: steps.marker.outputs.required == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$LEGACY_OCI_LICENSES" == "NOASSERTION" ]]; then
+            echo "Legacy image already uses NOASSERTION; no supplemental OCI metadata notice is required."
+            exit 0
+          fi
+
+          PREFIX="legacy-${DIGEST_SHORT}"
+          HARDEN_DIR="${RUNNER_TEMP}/legacy-backfill-hardening"
+          NOTICE_NAME="${PREFIX}-OCI_LICENSE_METADATA_NOTICE.txt"
+          CHECKSUM_NAME="${PREFIX}-OCI_LICENSE_METADATA_NOTICE.sha256"
+          mkdir -p "$HARDEN_DIR"
+
+          cat > "${HARDEN_DIR}/${NOTICE_NAME}" <<EOF_NOTICE
+          Legacy OCI license metadata clarification
+
+          Image: ${IMAGE_REF}
+          Immutable image digest: ${IMAGE_DIGEST}
+          Distributed org.opencontainers.image.licenses value: ${LEGACY_OCI_LICENSES}
+
+          The value above is preserved as a historical fact about this immutable
+          already-distributed image. It must not be interpreted as a blanket
+          relicensing of every software component contained in the image.
+
+          The authoritative component-level license and source information is the
+          digest-specific compliance material in this release, including the SPDX
+          SBOM, corresponding-source archives, component manifests and third-party
+          license/notice bundle.
+
+          Future images produced by the hardened workflow override the aggregate
+          OCI licenses annotation with the SPDX special identifier NOASSERTION.
+          EOF_NOTICE
+          sed -i 's/^          //' "${HARDEN_DIR}/${NOTICE_NAME}"
+
+          (
+            cd "$HARDEN_DIR"
+            sha256sum "$NOTICE_NAME" > "$CHECKSUM_NAME"
+            sha256sum -c "$CHECKSUM_NAME"
+          )
+
+          release_json() {
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          }
+
+          ensure_asset() {
+            local file="$1"
+            local name local_digest release_json_value count remote_digest
+            name=$(basename "$file")
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            release_json_value=$(release_json)
+            count=$(jq --arg name "$name" '[.assets[] | select(.name == $name)] | length' <<< "$release_json_value")
+
+            if [[ "$count" -gt 1 ]]; then
+              echo "ERROR: Multiple release assets named ${name} exist." >&2
+              exit 1
+            fi
+            if [[ "$count" -eq 1 ]]; then
+              remote_digest=$(jq -r --arg name "$name" '[.assets[] | select(.name == $name) | .digest][0] // empty' <<< "$release_json_value")
+              [[ -n "$remote_digest" ]] || {
+                echo "ERROR: Existing release asset ${name} has no GitHub digest." >&2
+                exit 1
+              }
+              [[ "$remote_digest" == "$local_digest" ]] || {
+                echo "ERROR: Existing release asset ${name} differs from the deterministic hardening file." >&2
+                echo "Local : ${local_digest}" >&2
+                echo "GitHub: ${remote_digest}" >&2
+                exit 1
+              }
+              echo "Existing hardening asset verified: ${name}"
+              return 0
+            fi
+
+            gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY"
+            remote_digest=""
+            for attempt in 1 2 3 4 5; do
+              release_json_value=$(release_json)
+              remote_digest=$(jq -r --arg name "$name" '[.assets[] | select(.name == $name) | .digest][0] // empty' <<< "$release_json_value")
+              [[ -n "$remote_digest" ]] && break
+              sleep $((attempt * 2))
+            done
+            [[ "$remote_digest" == "$local_digest" ]] || {
+              echo "ERROR: Uploaded hardening asset digest mismatch for ${name}." >&2
+              echo "Local : ${local_digest}" >&2
+              echo "GitHub: ${remote_digest:-<missing>}" >&2
+              exit 1
+            }
+            echo "Uploaded and verified hardening asset: ${name}"
+          }
+
+          ensure_asset "${HARDEN_DIR}/${NOTICE_NAME}"
+          ensure_asset "${HARDEN_DIR}/${CHECKSUM_NAME}"
 
       - name: Capture direct exact source and provenance
         if: steps.marker.outputs.required == 'true'
@@ -268,6 +443,7 @@ jobs:
           LinuxServer.io docker-ddclient release: ${LSIO_TAG}
           LinuxServer.io docker-ddclient source commit: ${LSIO_COMMIT}
           Project revision embedded in image: ${PROJECT_COMMIT}
+          Legacy org.opencontainers.image.licenses label: ${LEGACY_OCI_LICENSES}
           Backfill workflow revision: ${GITHUB_SHA}
           Backfill run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
@@ -276,6 +452,30 @@ jobs:
           the actual distributed binary rather than reconstructed from a current
           Dockerfile.
           INFO
+
+          if [[ "$LEGACY_OCI_LICENSES" != "NOASSERTION" ]]; then
+            cat > "${SOURCE_DIR}/${PREFIX}-OCI_LICENSE_METADATA_NOTICE.txt" <<INFO
+          OCI license metadata notice for legacy image
+
+          Image: ${IMAGE_REF}
+          Immutable digest: ${IMAGE_DIGEST}
+          Distributed org.opencontainers.image.licenses value: ${LEGACY_OCI_LICENSES}
+
+          This legacy image predates the downstream metadata correction. The
+          org.opencontainers.image.licenses value was inherited from an upstream
+          image and must not be interpreted as a blanket relicensing statement
+          for the aggregate container. The container contains independently
+          licensed components.
+
+          Authoritative component-level license and source information is
+          provided by this digest-specific compliance release, including its
+          SBOM, corresponding-source archives, individual upstream license files,
+          and third-party license/notice bundle.
+
+          Future images produced by the corrected workflow override the inherited
+          OCI value with the SPDX special identifier NOASSERTION.
+          INFO
+          fi
 
       - name: Collect corresponding source for all installed Alpine packages
         if: steps.marker.outputs.required == 'true'
@@ -462,6 +662,7 @@ jobs:
               -printf '%f\n' | sort | while read -r file; do
               sha256sum "$file"
             done > "${PREFIX}-BACKFILL_SHA256SUMS"
+            sha256sum -c "${PREFIX}-BACKFILL_SHA256SUMS"
           )
 
           # GitHub release assets must remain below GitHub's 2 GiB per-file limit.
@@ -498,31 +699,99 @@ jobs:
             --title "Legacy compliance source: ${IMAGE_REF##*:}" \
             --notes-file "$NOTES"
 
-      - name: Attach missing digest-specific source assets without overwriting history
+      - name: Attach or verify digest-specific source assets without overwriting history
         if: steps.marker.outputs.required == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          EXISTING=$(mktemp)
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' > "$EXISTING"
+
+          release_json() {
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          }
 
           uploaded=0
+          verified_existing=0
+
           while IFS= read -r -d '' file; do
             name=$(basename "$file")
-            if grep -Fxq "$name" "$EXISTING"; then
-              echo "Asset already exists; preserving it: $name"
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            RELEASE_JSON=$(release_json)
+            remote_count=$(jq --arg name "$name" '[.assets[] | select(.name == $name)] | length' <<< "$RELEASE_JSON")
+            if [[ "$remote_count" -gt 1 ]]; then
+              echo "ERROR: Multiple release assets named ${name} exist." >&2
+              exit 1
+            fi
+            remote_digest=$(jq -r --arg name "$name" '
+              [.assets[] | select(.name == $name) | .digest][0] // empty
+            ' <<< "$RELEASE_JSON")
+
+            if [[ "$remote_count" -eq 1 ]]; then
+              [[ -n "$remote_digest" ]] || {
+                echo "ERROR: Existing release asset ${name} has no GitHub digest; refusing to overwrite it." >&2
+                exit 1
+              }
+              if [[ "$remote_digest" != "$local_digest" ]]; then
+                echo "ERROR: Existing release asset ${name} differs from the newly generated file." >&2
+                echo "Local : ${local_digest}" >&2
+                echo "GitHub: ${remote_digest}" >&2
+                echo "Refusing to overwrite historical compliance material." >&2
+                exit 1
+              fi
+              echo "Existing asset verified by digest: ${name}"
+              verified_existing=$((verified_existing + 1))
               continue
             fi
+
             gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY"
+
+            uploaded_digest=""
+            for attempt in 1 2 3 4 5; do
+              RELEASE_JSON=$(release_json)
+              uploaded_digest=$(jq -r --arg name "$name" '
+                [.assets[] | select(.name == $name) | .digest][0] // empty
+              ' <<< "$RELEASE_JSON")
+              [[ -n "$uploaded_digest" ]] && break
+              sleep $((attempt * 2))
+            done
+
+            if [[ "$uploaded_digest" != "$local_digest" ]]; then
+              echo "ERROR: Uploaded release asset digest mismatch for ${name}." >&2
+              echo "Local : ${local_digest}" >&2
+              echo "GitHub: ${uploaded_digest:-<missing>}" >&2
+              exit 1
+            fi
             uploaded=$((uploaded + 1))
           done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -print0 | sort -z)
 
-          echo "Uploaded ${uploaded} new source/compliance assets to ${RELEASE_TAG}."
+          # Final pass: every generated local file must exist remotely with the same digest.
+          RELEASE_JSON=$(release_json)
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            remote_count=$(jq --arg name "$name" '[.assets[] | select(.name == $name)] | length' <<< "$RELEASE_JSON")
+            [[ "$remote_count" -eq 1 ]] || {
+              echo "ERROR: Expected exactly one remote asset named ${name}, found ${remote_count}." >&2
+              exit 1
+            }
+            remote_digest=$(jq -r --arg name "$name" '
+              [.assets[] | select(.name == $name) | .digest][0] // empty
+            ' <<< "$RELEASE_JSON")
+            if [[ "$remote_digest" != "$local_digest" ]]; then
+              echo "ERROR: Final remote digest verification failed for ${name}." >&2
+              echo "Local : ${local_digest}" >&2
+              echo "GitHub: ${remote_digest:-<missing>}" >&2
+              exit 1
+            fi
+          done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -print0 | sort -z)
 
-      - name: Verify backfill marker is publicly attached
+          echo "Uploaded ${uploaded} new assets and verified ${verified_existing} pre-existing assets; all remote digests match."
+
+      - name: Verify backfill marker and checksum manifest are publicly attached
         if: steps.marker.outputs.required == 'true'
         shell: bash
         env:
@@ -530,9 +799,20 @@ jobs:
         run: |
           set -euo pipefail
           MARKER="legacy-${DIGEST_SHORT}-BACKFILL_SOURCE_INFO.txt"
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' | grep -Fxq "$MARKER" || {
-              echo "ERROR: Backfill marker was not attached to ${RELEASE_TAG}." >&2
+          CHECKSUM="legacy-${DIGEST_SHORT}-BACKFILL_SHA256SUMS"
+          RELEASE_JSON=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+
+          for required in "$MARKER" "$CHECKSUM"; do
+            digest=$(jq -r --arg name "$required" '
+              [.assets[] | select(.name == $name) | .digest][0] // empty
+            ' <<< "$RELEASE_JSON")
+            if [[ -z "$digest" ]]; then
+              echo "ERROR: Required backfill asset ${required} is missing or lacks a GitHub digest." >&2
               exit 1
-            }
-          echo "Backfill complete for ${IMAGE_REF}@${IMAGE_DIGEST}."
+            fi
+          done
+
+          echo "Backfill complete and remotely verified for ${IMAGE_REF}@${IMAGE_DIGEST}."

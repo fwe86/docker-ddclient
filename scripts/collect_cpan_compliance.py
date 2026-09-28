@@ -34,12 +34,16 @@ def collect_license_material(source: Path, destination: Path, prefix: str) -> li
     def store(name: str, data: bytes) -> None:
         if len(data) > MAX_LICENSE_BYTES:
             return
-        target = destination / f"{safe_name(prefix)}__{safe_name(name)}"
-        counter = 1
-        while target.exists():
-            target = destination / f"{safe_name(prefix)}__{counter}__{safe_name(name)}"
-            counter += 1
-        target.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        target = destination / f"sha256-{digest}"
+        if target.exists():
+            existing = hashlib.sha256(target.read_bytes()).hexdigest()
+            if existing != digest:
+                raise SystemExit(
+                    f"SHA-256 filename collision while collecting CPAN license material: {target}"
+                )
+        else:
+            target.write_bytes(data)
         collected.append(target.name)
 
     try:
@@ -174,7 +178,8 @@ def main() -> int:
         if not download_url:
             raise SystemExit(f"MetaCPAN did not provide an exact source URL for {module} {version}")
 
-        meta_file = bundle / "metacpan" / f"{safe_name(module)}-{safe_name(version)}.json"
+        metadata_key = hashlib.sha256(f"{module}\0{version}".encode("utf-8")).hexdigest()
+        meta_file = bundle / "metacpan" / f"sha256-{metadata_key}.json"
         meta_file.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         if download_url in downloaded:
@@ -183,11 +188,18 @@ def main() -> int:
             basename = Path(urllib.parse.urlparse(download_url).path).name
             if not basename:
                 raise SystemExit(f"Invalid MetaCPAN download URL for {module}: {download_url}")
-            target = bundle / "sources" / basename
+            url_key = hashlib.sha256(download_url.encode("utf-8")).hexdigest()
+            temporary = bundle / "sources" / f"download-{url_key}"
+            download(download_url, temporary)
+            digest = sha256(temporary)
+            target = bundle / "sources" / f"sha256-{digest}"
             if target.exists():
-                target = bundle / "sources" / f"{safe_name(module)}-{basename}"
-            download(download_url, target)
-            digest = sha256(target)
+                existing = sha256(target)
+                if existing != digest:
+                    raise SystemExit(f"SHA-256 filename collision for CPAN source: {target}")
+                temporary.unlink()
+            else:
+                temporary.replace(target)
             source_file = target.relative_to(bundle).as_posix()
             downloaded[download_url] = (source_file, digest)
 
