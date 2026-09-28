@@ -35,6 +35,19 @@ def _safe_fragment(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.+-]+", "_", value)
 
 
+def store_content_addressed(destination: Path, data: bytes) -> Path:
+    """Store a blob under a deterministic fixed-length SHA-256 filename."""
+    destination.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(data).hexdigest()
+    target = destination / f"sha256-{digest}"
+    if target.exists():
+        if target.read_bytes() != data:
+            raise RuntimeError(f"SHA-256 collision while storing license material: {target}")
+    else:
+        target.write_bytes(data)
+    return target
+
+
 def collect_license_material(source: Path, destination: Path, prefix: str) -> list[str]:
     """Extract only small license/notice files from a source archive.
 
@@ -47,13 +60,9 @@ def collect_license_material(source: Path, destination: Path, prefix: str) -> li
     def store(name: str, data: bytes) -> None:
         if len(data) > MAX_LICENSE_BYTES:
             return
-        target = destination / f"{_safe_fragment(prefix)}__{_safe_fragment(name)}"
-        counter = 1
-        while target.exists():
-            target = destination / f"{_safe_fragment(prefix)}__{counter}__{_safe_fragment(name)}"
-            counter += 1
-        target.write_bytes(data)
-        collected.append(target.name)
+        target = store_content_addressed(destination, data)
+        if target.name not in collected:
+            collected.append(target.name)
 
     try:
         if tarfile.is_tarfile(source):
@@ -224,7 +233,20 @@ def main() -> int:
         run(["git", "init", str(git_repo)], capture=False)
         run(["git", "-C", str(git_repo), "remote", "add", "origin", APORTS_REMOTE], capture=False)
 
-    fetched: set[str] = set()
+    # Fetch every exact aports commit in one shallow transaction. Repeated
+    # depth-1 fetches into the same shallow repository mutate .git/shallow on
+    # every iteration and can fail with "shallow file has changed since we read
+    # it". A single fetch writes the shallow boundary once and keeps the exact
+    # commit-level provenance required by this collector.
+    commits = sorted({commit for (_origin, commit) in source_units})
+    if commits:
+        run(
+            ["git", "-C", str(git_repo), "fetch", "--no-tags", "--depth=1", "origin", *commits],
+            capture=False,
+        )
+        for commit in commits:
+            run(["git", "-C", str(git_repo), "cat-file", "-e", f"{commit}^{{commit}}"], capture=False)
+
     fetch_plan: list[tuple[str, str]] = []
     source_manifest = bundle / "ALPINE_SOURCE_UNITS.tsv"
     with source_manifest.open("w", encoding="utf-8", newline="") as fh:
@@ -232,13 +254,6 @@ def main() -> int:
         writer.writerow(["origin", "aports_commit", "repository", "installed_packages", "licenses", "source_path"])
 
         for (origin, commit), unit in sorted(source_units.items()):
-            if commit not in fetched:
-                run(
-                    ["git", "-C", str(git_repo), "fetch", "--no-tags", "--depth=1", "origin", commit],
-                    capture=False,
-                )
-                fetched.add(commit)
-
             repository = next((repo for repo in REPOSITORIES if git_has_path(git_repo, commit, f"{repo}/{origin}")), None)
             if repository is None:
                 raise SystemExit(f"Could not locate APKBUILD for source package {origin} at aports commit {commit}")
@@ -307,9 +322,7 @@ chmod -R a+rX /compliance/distfiles
         local_source_dir = bundle / rel
         for candidate in sorted(local_source_dir.rglob("*")):
             if candidate.is_file() and LICENSE_BASENAME.match(candidate.name) and candidate.stat().st_size <= MAX_LICENSE_BYTES:
-                target = license_dir / f"{_safe_fragment(unit_id)}__aports__{_safe_fragment(candidate.relative_to(local_source_dir).as_posix())}"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(candidate, target)
+                target = store_content_addressed(license_dir, candidate.read_bytes())
                 license_rows.append([unit_id, candidate.relative_to(bundle).as_posix(), target.relative_to(bundle).as_posix()])
         dist_dir = bundle / "distfiles" / unit_id
         if dist_dir.is_dir():
