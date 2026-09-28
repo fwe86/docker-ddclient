@@ -24,7 +24,7 @@ import re
 from collections import OrderedDict
 from pathlib import Path
 
-APORTS_REMOTE = "https://gitlab.alpinelinux.org/alpine/aports.git"
+APORTS_REMOTE = "https://github.com/alpinelinux/aports.git"
 REPOSITORIES = ("main", "community", "testing")
 
 LICENSE_BASENAME = re.compile(r"^(?:license|licence|copying|copyright|notice)(?:[._-].*)?$", re.IGNORECASE)
