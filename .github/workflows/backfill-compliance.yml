@@ -328,7 +328,12 @@ jobs:
           git -C "$S6_REPO" remote add origin https://github.com/just-containers/s6-overlay.git
           git -C "$S6_REPO" fetch -q --depth=1 origin \
             "refs/tags/v${S6_VERSION}:refs/tags/v${S6_VERSION}"
-          S6_COMMIT=$(git -C "$S6_REPO" rev-list -n1 "v${S6_VERSION}")
+          git -C "$S6_REPO" checkout -q --detach "refs/tags/v${S6_VERSION}"
+          [[ -f "$S6_REPO/conf/versions" ]] || {
+            echo "ERROR: s6-overlay v${S6_VERSION} was fetched but conf/versions is missing from the checked-out worktree." >&2
+            exit 1
+          }
+          S6_COMMIT=$(git -C "$S6_REPO" rev-parse HEAD)
           git -C "$S6_REPO" archive --format=tar.gz \
             --prefix="s6-overlay-v${S6_VERSION}/" \
             -o "${SOURCE_DIR}/${PREFIX}-s6-overlay-v${S6_VERSION}.tar.gz" \

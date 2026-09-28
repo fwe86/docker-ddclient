@@ -19,7 +19,8 @@ fetch_exact_tag() {
   git init -q "$dest"
   git -C "$dest" remote add origin "$repo_url"
   git -C "$dest" fetch -q --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
-  git -C "$dest" rev-list -n1 "$tag"
+  git -C "$dest" checkout -q --detach "refs/tags/${tag}"
+  git -C "$dest" rev-parse HEAD
 }
 
 BASE_COMMIT="$(fetch_exact_tag \
@@ -53,6 +54,10 @@ S6_VERSION="$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+S6_OVERLAY_VERSION="?([^"[:
 
 S6_TAG="v${S6_VERSION}"
 S6_COMMIT="$(fetch_exact_tag https://github.com/just-containers/s6-overlay.git "$S6_TAG" "$S6_REPO")"
+[[ -f "$S6_REPO/conf/versions" ]] || {
+  echo "s6-overlay ${S6_TAG} was fetched but conf/versions is missing from the checked-out worktree" >&2
+  exit 1
+}
 git -C "$S6_REPO" archive \
   --format=tar.gz \
   --prefix="s6-overlay-${S6_TAG}/" \
