@@ -20,12 +20,16 @@ fetch_exact_tag() {
   git -C "$dest" remote add origin "$repo_url"
   git -C "$dest" fetch -q --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
   git -C "$dest" checkout -q --detach "refs/tags/${tag}"
-  git -C "$dest" rev-parse HEAD
 }
 
-BASE_COMMIT="$(fetch_exact_tag \
+# Keep the fetch at top level instead of hiding it in command substitution.
+# Bash disables errexit inside command substitutions unless inherit_errexit is
+# enabled; a failed fetch could otherwise continue into checkout/rev-parse and
+# obscure the real failure.
+fetch_exact_tag \
   https://github.com/linuxserver/docker-baseimage-alpine.git \
-  "$BASE_RELEASE" "$BASE_REPO")"
+  "$BASE_RELEASE" "$BASE_REPO"
+BASE_COMMIT="$(git -C "$BASE_REPO" rev-parse HEAD)"
 
 git -C "$BASE_REPO" archive \
   --format=tar.gz \
@@ -53,7 +57,8 @@ S6_VERSION="$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+S6_OVERLAY_VERSION="?([^"[:
 }
 
 S6_TAG="v${S6_VERSION}"
-S6_COMMIT="$(fetch_exact_tag https://github.com/just-containers/s6-overlay.git "$S6_TAG" "$S6_REPO")"
+fetch_exact_tag https://github.com/just-containers/s6-overlay.git "$S6_TAG" "$S6_REPO"
+S6_COMMIT="$(git -C "$S6_REPO" rev-parse HEAD)"
 [[ -f "$S6_REPO/conf/versions" ]] || {
   echo "s6-overlay ${S6_TAG} was fetched but conf/versions is missing from the checked-out worktree" >&2
   exit 1
