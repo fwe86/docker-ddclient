@@ -648,7 +648,7 @@ jobs:
             --target "$PROJECT_COMMIT" \
             --title "Compliance source for ${IMAGE_TAG}" \
             --notes-file "${SOURCE_DIR}/RELEASE_NOTES.md" \
-            --prerelease \
+            --latest \
             "${ASSETS[@]}"
 
           EXPECTED=${#ASSETS[@]}
